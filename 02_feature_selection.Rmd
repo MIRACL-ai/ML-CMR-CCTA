@@ -1,0 +1,120 @@
+---
+title: "ICPS/Lariboisiere - ML CMR CCTA"
+author: "Solenn Toupin, PhD"
+date: "08/03/2024"
+output:
+  word_document:
+    toc: yes
+    toc_depth: '3'
+  pdf_document: default
+  html_notebook:
+    toc: yes
+    toc_float: yes
+  editor_options:
+    markdown:
+      wrap: sentence
+  html_document:
+    toc: yes
+    toc_depth: 3
+    number_sections: no
+    theme: united
+    highlight: tango
+---
+
+```{r, echo = FALSE, warning= FALSE}
+library(tidyverse)
+library(dplyr)
+library(gtsummary)
+library(officer)
+library(flextable)
+knitr::asis_output("\U00B1")
+library(survival)
+library(survminer)
+library(ggplot2)
+library(readr)
+library("readxl")
+library(partykit)
+library(mfp)
+library(survIDINRI)
+library(glmnet)
+library(survival)
+library(caret)
+library(Hmisc)
+```
+
+# Read data
+```{r}
+library(readr)
+dataset_Train <- read_csv("/Users/solenntoupin/Documents/Projets_R/ML_CMR_CCTA_mise_au_propre/data/Dataset_Train.csv")
+dataset_Train_select <- subset(dataset_Train,select = -c(...1,Time_MACE,Time_MACE_years,Followup_Time,MACE,
+                                                         score_FRS, Score_SIS, Score_SIS_2, Score_SSS, Score_ESC, Score_QRISK3, Score_C_CMR_10,                                       Score_ML_CMR,Dyspnea,Ischemia,LGE,Symptomatic_Angina,Viability_if_LGE,Revascularization,Segments_Calcified_or_Mixed_Plaques,Segments_Calcified_Plaques,LVESVi,Segments_Stenosis_Sup_70percent,Proximal_Segments_Stenosis_Sup_70percent))
+```
+# Correlation plots {.tabset}
+
+## CMR
+```{r}
+subset <- dataset_Train %>%  
+        dplyr::select(LVEF, LVEDVi, LVESVi, Ischemia_Segments, LGE_Segments) 
+
+mcor <- cor(subset)
+library(corrplot)
+corrplot(mcor, method="number", type = "upper")
+```
+
+## CCTA
+```{r}
+subset <- data %>%  
+        dplyr::select(Segments_Stenosis_Sup_70percent, Segments_Stenosis_Sup_50percent, Proximal_Segments_Stenosis_Sup_50percent, Segments_Noncalcified_Plaques, Segments_Mixed_Plaques, Segments_Calcified_Plaques, Segments_Calcified_or_Mixed_Plaques, Proximal_Segments_Stenosis_Sup_70percent, Vessels_Obstructive_CAD) 
+
+mcor <- cor(subset)
+library(corrplot)
+corrplot(mcor, method="number", type = "upper")
+```
+
+
+# LASSO glm
+```{r}
+dataset_Train_select <- subset(dataset_Train,select = -c(...1,Time_MACE,Time_MACE_years,Followup_Time,MACE,
+                                                         score_FRS, Score_SIS, Score_SIS_2, Score_SSS, Score_ESC, Score_QRISK3, Score_C_CMR_10,                                       Score_ML_CMR,Dyspnea,Ischemia,LGE,Symptomatic_Angina,Viability_if_LGE,Revascularization,LVESVi,Segments_Stenosis_Sup_70percent,Proximal_Segments_Stenosis_Sup_70percent,Segments_Calcified_Plaques,Segments_Calcified_or_Mixed_Plaques))
+
+set.seed(1)
+
+y <- dataset_Train$MACE
+x <- data.matrix(dataset_Train_select)
+
+cvfit <- cv.glmnet(x, y, family = "binomial", type.measure = "auc")
+```
+
+```{r}
+plot(cvfit)
+```
+
+```{r}
+coef(cvfit, s = cvfit$lambda.1se)
+```
+
+```{r}
+library(plotmo)
+mod <- glmnet(x, y)
+plot_glmnet(mod) 
+```
+```{r}
+coef(cvfit, s = 0.02)
+```
+
+# LASSO on only clinical variables
+```{r}
+dataset_Train_clinical <- subset(dataset_Train,select = c(Gender,Age,Cardiac_Rhythm,BMI,Obesity,BSA,Dyslipidemia,Diabetes,Hypertension,Smoking,Family_History_CAD,Renal_Failure,Stroke,Pacemaker,Peripheral_Atheroma,History_Hospit_HF))
+
+set.seed(1)
+
+y <- dataset_Train$MACE
+x <- data.matrix(dataset_Train_clinical)
+
+cvfit <- cv.glmnet(x, y, family = "binomial", type.measure = "auc")
+plot(cvfit)
+```
+
+```{r}
+coef(cvfit, s = cvfit$lambda.min)
+```

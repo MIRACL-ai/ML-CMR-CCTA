@@ -1,0 +1,1855 @@
+---
+title: "ICPS/Lariboisiere - ML CMR CCTA"
+author: "Solenn Toupin, PhD"
+date: "08/03/2024"
+output:
+  html_notebook:
+    toc: yes
+    toc_float: yes
+  pdf_document: default
+  html_document:
+    toc: yes
+    toc_depth: 3
+    number_sections: no
+    theme: united
+    highlight: tango
+  editor_options:
+    markdown:
+      wrap: sentence
+  word_document:
+    toc: yes
+    toc_depth: '3'
+---
+
+```{r, echo = FALSE, warning= FALSE}
+library(tidyverse)
+library(dplyr)
+library(gtsummary)
+library(officer)
+library(flextable)
+knitr::asis_output("\U00B1")
+library(survival)
+library(survminer)
+library(ggplot2)
+library(readr)
+library("readxl")
+library(partykit)
+library(mfp)
+library(survIDINRI)
+library(glmnet)
+library(survival)
+library(caret)
+library(Hmisc)
+library(pROC)
+library(MLmetrics)
+library(DescTools) # Brier score function
+library(irr) # Kappa2 function
+```
+
+# Read data
+```{r}
+library(readr)
+dataset_Train <- read_csv("/Users/solenntoupin/Documents/Projets_R/ML_CMR_CCTA_mise_au_propre/data/Dataset_Train.csv")
+dataset_Validation <- read_csv("/Users/solenntoupin/Documents/Projets_R/ML_CMR_CCTA_mise_au_propre/data/dataset_Test.csv")
+dataset_Test_1 <- read_csv("/Users/solenntoupin/Documents/Projets_R/ML_CMR_CCTA_mise_au_propre/data/Dataset_Validation.csv")
+dataset_Test_2 <- read_csv("/Users/solenntoupin/Documents/Projets_R/ML_CMR_CCTA_mise_au_propre/data/dataset_Validation_2.csv")
+
+```
+
+# Feature selection
+
+```{r}
+dataset_Train_selection <- subset(dataset_Train,select = c(LVEF, Ischemia_Segments, LGE_Segments, MACE, Segments_Noncalcified_Plaques, Vessels_Obstructive_CAD, Proximal_Segments_Stenosis_Sup_50percent))
+
+dataset_Validation_selection <- subset(dataset_Validation,select = c(LVEF, Ischemia_Segments, LGE_Segments, MACE, Segments_Noncalcified_Plaques, Vessels_Obstructive_CAD, Proximal_Segments_Stenosis_Sup_50percent))
+
+dataset_Test_1_selection <- subset(dataset_Test_1,select = c(LVEF, Ischemia_Segments, LGE_Segments, MACE, Segments_Noncalcified_Plaques, Vessels_Obstructive_CAD,  Proximal_Segments_Stenosis_Sup_50percent))
+  
+dataset_Test_2_selection <- subset(dataset_Test_2,select = c(LVEF, Ischemia_Segments, LGE_Segments, MACE, Segments_Noncalcified_Plaques, Vessels_Obstructive_CAD,  Proximal_Segments_Stenosis_Sup_50percent))
+```
+
+# Home-made functions to determine the classification threshold given the best F1 score
+```{r}
+
+myfunction <- function(thresh,y_observed,y_predicted){
+        rep <- ifelse(y_predicted >= thresh, 1, 0) 
+        ifelse(sum(rep) > 0 & sum(rep) < length(rep), F1_Score(y_true = y_observed, y_pred = rep,  positive = "1"),0)
+}
+
+get_best_threshold <- function(y_true, y_pred) 
+{
+        f1.max <- 0
+        thresholds <- seq(0.01, 0.99, .01)
+        threshold.max <- 0
+        for(i in thresholds){
+
+                f1_tmp <- myfunction(i,y_observed = y_true, y_predicted = y_pred)
+                if(!is.na(f1_tmp) & f1_tmp > f1.max)
+                {
+                        f1.max <- myfunction(i,y_observed = y_true, y_predicted = y_pred)
+                        threshold.max <- i
+                }
+        }
+        
+        return(threshold.max)
+}
+```
+
+# ML algorithms training
+
+## GLM
+```{r}
+resGLM <- glm(MACE ~., data = dataset_Train_selection, family = "binomial")
+
+probGLM_Train = predict(resGLM, newdata=dataset_Train_selection, type = "response") 
+best_threshold_GLM = get_best_threshold(y_true = dataset_Train_selection$MACE, y_pred = probGLM_Train)
+```
+
+## XGBoost
+
+### Step 1
+```{r}
+dataset_train_XGB <- dataset_Train_selection
+dataset_train_XGB$Ischemia_Segments <- as.numeric(dataset_train_XGB$Ischemia_Segments)
+dataset_train_XGB$LGE_Segments <- as.numeric(dataset_train_XGB$LGE_Segments)
+dataset_train_XGB$LVEF <- as.numeric(dataset_train_XGB$LVEF)
+dataset_train_XGB$Proximal_Segments_Stenosis_Sup_50percent <- as.numeric(dataset_train_XGB$Proximal_Segments_Stenosis_Sup_50percent)
+dataset_train_XGB$Segments_Noncalcified_Plaques <- as.numeric(dataset_train_XGB$Segments_Noncalcified_Plaques)
+dataset_train_XGB$Vessels_Obstructive_CAD <- as.numeric(dataset_train_XGB$Vessels_Obstructive_CAD)
+dataset_train_XGB$MACE <- ifelse(dataset_train_XGB$MACE == 0,"X0","X1")
+
+nrounds <- 1000
+
+# note to start nrounds from 200, as smaller learning rates result in errors so
+# big with lower starting points that they'll mess the scales
+tune_grid <- expand.grid(
+  nrounds = seq(from = 200, to = nrounds, by = 50),
+  eta = c(0.025, 0.05, 0.1, 0.3),
+  max_depth = c(2, 3, 4, 5, 6),
+  gamma = 0,
+  colsample_bytree = 1,
+  min_child_weight = 1,
+  subsample = 1
+)
+
+tune_control <- caret::trainControl(
+  method = "cv", # cross-validation
+  number = 3, # with n folds 
+  #index = createFolds(tr_treated$Id_clean), # fix the folds
+  verboseIter = FALSE, # no training log
+  allowParallel = TRUE, # FALSE for reproducible results
+  classProbs = TRUE
+)
+
+xgb_tune <- caret::train(
+  MACE ~ .,
+  data = dataset_train_XGB,
+  trControl = tune_control,
+  tuneGrid = tune_grid,
+  method = "xgbTree",
+  verbose = TRUE,
+  metric = "ROC"
+)
+
+# helper function for the plots
+tuneplot <- function(x, probs = .90) {
+  ggplot(x)
+}
+
+tuneplot(xgb_tune)
+
+xgb_tune$bestTune
+
+```
+
+```{r}
+xgb_tune$bestTune
+```
+
+
+### Step 2: Maximum Depth and Minimum Child Weight
+
+```{r}
+tune_grid2 <- expand.grid(
+  nrounds = seq(from = 50, to = nrounds, by = 50),
+  eta = xgb_tune$bestTune$eta,
+  max_depth = ifelse(xgb_tune$bestTune$max_depth == 2,
+    c(xgb_tune$bestTune$max_depth:4),
+    xgb_tune$bestTune$max_depth - 1:xgb_tune$bestTune$max_depth + 1),
+  gamma = 0,
+  colsample_bytree = 1,
+  min_child_weight = c(1, 2, 3),
+  subsample = 1
+)
+
+xgb_tune2 <- caret::train(
+  MACE ~ .,
+  data = dataset_train_XGB,
+  trControl = tune_control,
+  tuneGrid = tune_grid2,
+  method = "xgbTree",
+  verbose = TRUE
+)
+
+tuneplot(xgb_tune2)
+```
+```{r}
+xgb_tune2$bestTune
+```
+
+### Step 3: Column and Row Sampling
+
+```{r}
+tune_grid3 <- expand.grid(
+  nrounds = seq(from = 50, to = nrounds, by = 50),
+  eta = xgb_tune$bestTune$eta,
+  max_depth = xgb_tune2$bestTune$max_depth,
+  gamma = 0,
+  colsample_bytree = c(0.4, 0.6, 0.8, 1.0),
+  min_child_weight = xgb_tune2$bestTune$min_child_weight,
+  subsample = c(0.5, 0.75, 1.0)
+)
+
+xgb_tune3 <- caret::train(
+  MACE ~ .,
+  data = dataset_train_XGB,
+  trControl = tune_control,
+  tuneGrid = tune_grid3,
+  method = "xgbTree",
+  verbose = TRUE
+)
+
+tuneplot(xgb_tune3, probs = .95)
+```
+
+```{r}
+xgb_tune3$bestTune
+
+```
+
+
+### Step 4: Gamma
+
+```{r}
+tune_grid4 <- expand.grid(
+  nrounds = seq(from = 50, to = nrounds, by = 50),
+  eta = xgb_tune$bestTune$eta,
+  max_depth = xgb_tune2$bestTune$max_depth,
+  gamma = c(0, 0.05, 0.1, 0.5, 0.7, 0.9, 1.0),
+  colsample_bytree = xgb_tune3$bestTune$colsample_bytree,
+  min_child_weight = xgb_tune2$bestTune$min_child_weight,
+  subsample = xgb_tune3$bestTune$subsample
+)
+
+xgb_tune4 <- caret::train(
+  MACE ~ .,
+  data = dataset_train_XGB,
+  trControl = tune_control,
+  tuneGrid = tune_grid4,
+  method = "xgbTree",
+  verbose = TRUE
+)
+
+tuneplot(xgb_tune4)
+```
+
+```{r}
+xgb_tune4$bestTune
+```
+### Step 5: Reducing the Learning Rate
+Now, we have tuned the hyperparameters and can start reducing the learning rate to get to the final model:
+
+
+```{r}
+tune_grid5 <- expand.grid(
+  nrounds = seq(from = 100, to = 10000, by = 100),
+  eta = c(0.01, 0.015, 0.025, 0.05, 0.1),
+  max_depth = xgb_tune2$bestTune$max_depth,
+  gamma = xgb_tune4$bestTune$gamma,
+  colsample_bytree = xgb_tune3$bestTune$colsample_bytree,
+  min_child_weight = xgb_tune2$bestTune$min_child_weight,
+  subsample = xgb_tune3$bestTune$subsample
+)
+
+xgb_tune5 <- caret::train(
+  MACE ~ .,
+  data = dataset_train_XGB,
+  trControl = tune_control,
+  tuneGrid = tune_grid5,
+  method = "xgbTree",
+  verbose = TRUE
+)
+
+tuneplot(xgb_tune5)
+```
+```{r}
+xgb_tune5$bestTune
+```
+
+```{r}
+ctrlspecs <- trainControl(method="cv", number=5)
+
+final_grid <- expand.grid(
+  nrounds = 700,
+  eta = 0.025,
+  max_depth = 2,
+  gamma = 0,
+  colsample_bytree = 1,
+  min_child_weight = 2,
+  subsample = 0.75)
+
+xgb_model <- train(
+  MACE ~ .,
+  data = dataset_train_XGB,
+  trControl = ctrlspecs,
+  tuneGrid = final_grid,
+  method = "xgbTree",
+  verbose = TRUE
+)
+
+probXGB_Train = predict(xgb_model,newdata=dataset_Train_selection, type="prob")
+probXGB_Train = probXGB_Train[,2]
+best_threshold_XGB = get_best_threshold(y_true = dataset_Train_selection$MACE, y_pred = probXGB_Train)
+
+```
+
+
+
+## Random Forest Ranger
+```{r}
+dataset_Train_RF <- dataset_train_XGB
+
+ctrlspecs <- trainControl(method="cv", number=5, classProbs = TRUE)
+
+gridRanger <- data.frame(
+  .mtry = c(2,3,4,5),
+  .splitrule = "gini",
+  .min.node.size = c(5,10,15,20))
+
+set.seed(123)
+resRanger <- train(MACE ~ .,
+          data = dataset_Train_RF,
+          trControl = ctrlspecs,
+          tuneGrid = gridRanger,
+          method = "ranger")
+
+probRF_Train = predict(resRanger, newdata=dataset_Train_RF, type = "prob") 
+probRF_Train = probRF_Train[,2]
+best_threshold_RF = get_best_threshold(y_true = dataset_Train_selection$MACE, y_pred = probRF_Train)
+```
+
+## MFP 
+```{r}
+MFP_glm <- mfp(MACE ~ fp(Ischemia_Segments) + fp(LGE_Segments) + fp(Vessels_Obstructive_CAD)  + fp(LVEF) + fp(Segments_Noncalcified_Plaques) + fp(Proximal_Segments_Stenosis_Sup_50percent), data = dataset_Train_selection, select = 0.05, family = binomial, verbose=TRUE)
+
+summary(MFP_glm)
+
+prob_MFP_Train = predict(MFP_glm, newdata=dataset_Train_selection, type="response")
+prob_MFP_Train <- as.numeric(prob_MFP_Train)
+best_threshold_MFP =  get_best_threshold(y_true = dataset_Train_selection$MACE, y_pred = prob_MFP_Train)
+
+```
+
+## Neural Network
+```{r}
+dataset_Train_NN <- dataset_Train_selection
+dataset_Train_NN$MACE <- ifelse(dataset_Train_NN$MACE == 0,"X0","X1")
+dataset_Train_NN$MACE <- as.factor(dataset_Train_NN$MACE)
+
+resNN <- train(MACE ~ .,
+               data = dataset_Train_NN, 
+               method = "nnet", trControl = ctrlspecs)
+
+prob_NN_Train = predict(resNN, newdata=dataset_Train_selection, type="prob")
+prob_NN_Train <- prob_NN_Train[,2]
+best_threshold_NN = get_best_threshold(y_true = dataset_Train_selection$MACE, y_pred = prob_NN_Train)
+```
+
+# Performance metrics
+
+## Validation dataset = 30% ICPS
+```{r}
+probGLM_Validation = predict(resGLM, newdata=dataset_Validation_selection, type = "response") 
+repGLM_Validation = ifelse(probGLM_Validation >= best_threshold_GLM,1,0) 
+
+probRF_Validation = predict(resRanger, newdata=dataset_Validation_selection, type = "prob")
+probRF_Validation = probRF_Validation[,2]
+repRF_Validation = ifelse(probRF_Validation >= best_threshold_RF,1,0)
+
+probXGB_Validation = predict(xgb_model,newdata=dataset_Validation_selection, type="prob")
+probXGB_Validation = probXGB_Validation[,2]
+repXGB_Validation = ifelse(probXGB_Validation >= best_threshold_XGB,1,0)
+
+prob_MFP_Validation = predict(MFP_glm, newdata=dataset_Validation_selection, type="response")
+prob_MFP_Validation <- as.numeric(prob_MFP_Validation)
+repMFP_Validation = ifelse(prob_MFP_Validation >= best_threshold_MFP,1,0)
+
+prob_NN_Validation = predict(resNN, newdata=dataset_Validation_selection, type="prob")
+prob_NN_Validation <- prob_NN_Validation[,2]
+repNN_Validation = ifelse(prob_NN_Validation >= best_threshold_NN,1,0)
+
+auc_glm_Validation <- round(auc(dataset_Validation_selection$MACE, probGLM_Validation),4) #0.843 -5
+auc_RF_Validation <- round(auc(dataset_Validation_selection$MACE, probRF_Validation),4) #0.8429 -6
+auc_xgb_Validation <- round(auc(dataset_Validation_selection$MACE, probXGB_Validation),4) #0.8546 -1
+auc_MFP_Validation <- round(auc(dataset_Validation_selection$MACE, prob_MFP_Validation),4) #0.8497 -3
+auc_NN_Validation <- round(auc(dataset_Validation_selection$MACE, prob_NN_Validation),4) #0.8375
+
+PR_auc_glm_Validation <- PRAUC(y_pred = probGLM_Validation, y_true = dataset_Validation_selection$MACE) #0.5001 -6
+PR_auc_RF_Validation <- PRAUC(y_pred = probRF_Validation, y_true = dataset_Validation_selection$MACE) #0.5617 -4
+PR_auc_XGB_Validation <- PRAUC(y_pred = probXGB_Validation, y_true = dataset_Validation_selection$MACE) #0.5828 -1
+PR_auc_MFP_Validation <- PRAUC(y_pred = prob_MFP_Validation, y_true = dataset_Validation_selection$MACE) #0.5142 -5
+PR_auc_NN_Validation <- PRAUC(y_pred = prob_NN_Validation, y_true = dataset_Validation_selection$MACE) #0.545
+
+f1_GLM_Validation <- F1_Score(y_pred = repGLM_Validation, y_true = dataset_Validation_selection$MACE,positive="1")
+f1_RF_Validation <- F1_Score(y_pred = repRF_Validation, y_true = dataset_Validation_selection$MACE,positive="1")
+f1_XGB_Validation <- F1_Score(y_pred = repXGB_Validation, y_true = dataset_Validation_selection$MACE,positive="1")
+f1_MFP_Validation <- F1_Score(y_pred = repMFP_Validation, y_true = dataset_Validation_selection$MACE,positive="1")
+f1_NN_Validation <- F1_Score(y_pred = repNN_Validation, y_true = dataset_Validation_selection$MACE,positive="1")
+
+ci.auc(dataset_Validation_selection$MACE, probXGB_Validation) 
+sensitivity_XGB_Validation <- Sensitivity(dataset_Validation_selection$MACE, repXGB_Validation, positive = "1")
+specificity_XGB_Validation <- Specificity(dataset_Validation_selection$MACE, repXGB_Validation, positive = "1")
+precision_XGB_Validation <- Precision(dataset_Validation_selection$MACE, repXGB_Validation, positive = "1")
+Brier_XGB_Validation <- BrierScore(dataset_Validation_selection$MACE, probXGB_Validation)
+accuracy_XGB_Validation = Accuracy(repXGB_Validation,dataset_Validation_selection$MACE)
+Kappa_XGB_Validation = kappa2(ratings = cbind(repXGB_Validation,dataset_Validation_selection$MACE))
+Kappa_XGB_Validation = Kappa_XGB_Validation$value
+balanced_accuracy_XGB = (sensitivity_XGB_Validation+specificity_XGB_Validation)/2
+cMatrix_XGB_Validation <- confusionMatrix(data=as.factor(repXGB_Validation), reference = as.factor(dataset_Validation_selection$MACE), positive = '1')
+cMatrix_XGB_Validation
+
+ci.auc(dataset_Validation_selection$MACE, probGLM_Validation) 
+sensitivity_GLM_Validation <- Sensitivity(dataset_Validation_selection$MACE, repGLM_Validation, positive = "1")
+specificity_GLM_Validation <- Specificity(dataset_Validation_selection$MACE, repGLM_Validation, positive = "1")
+precision_GLM_Validation <- Precision(dataset_Validation_selection$MACE, repGLM_Validation, positive = "1")
+Brier_GLM_Validation <- BrierScore(dataset_Validation_selection$MACE, probGLM_Validation)
+accuracy_GLM_Validation = Accuracy(repGLM_Validation,dataset_Validation_selection$MACE)
+Kappa_GLM_Validation = kappa2(ratings = cbind(repGLM_Validation,dataset_Validation_selection$MACE))
+Kappa_GLM_Validation = Kappa_GLM_Validation$value
+balanced_accuracy_GLM_Validation = (sensitivity_GLM_Validation+specificity_GLM_Validation)/2
+cMatrix_GLM_Validation <- confusionMatrix(data=as.factor(repGLM_Validation), reference = as.factor(dataset_Validation_selection$MACE), positive = '1')
+cMatrix_GLM_Validation
+
+ci.auc(dataset_Validation_selection$MACE, prob_MFP_Validation) 
+sensitivity_MFP_Validation <- Sensitivity(dataset_Validation_selection$MACE, repMFP_Validation, positive = "1")
+specificity_MFP_Validation <- Specificity(dataset_Validation_selection$MACE, repMFP_Validation, positive = "1")
+precision_MFP_Validation <- Precision(dataset_Validation_selection$MACE, repMFP_Validation, positive = "1")
+Brier_MFP_Validation <- BrierScore(dataset_Validation_selection$MACE, prob_MFP_Validation)
+accuracy_MFP_Validation = Accuracy(repMFP_Validation,dataset_Validation_selection$MACE)
+Kappa_MFP_Validation = kappa2(ratings = cbind(repMFP_Validation,dataset_Validation_selection$MACE))
+Kappa_MFP_Validation = Kappa_MFP_Validation$value
+balanced_accuracy_MFP_Validation = (sensitivity_MFP_Validation+specificity_MFP_Validation)/2
+cMatrix_MFP_Validation <- confusionMatrix(data=as.factor(repMFP_Validation), reference = as.factor(dataset_Validation_selection$MACE), positive = '1')
+cMatrix_MFP_Validation
+
+ci.auc(dataset_Validation_selection$MACE, probRF_Validation) 
+sensitivity_RF_Validation <- Sensitivity(dataset_Validation_selection$MACE, repRF_Validation, positive = "1")
+specificity_RF_Validation <- Specificity(dataset_Validation_selection$MACE, repRF_Validation, positive = "1")
+precision_RF_Validation <- Precision(dataset_Validation_selection$MACE, repRF_Validation, positive = "1")
+Brier_RF_Validation <- BrierScore(dataset_Validation_selection$MACE, probRF_Validation)
+accuracy_RF_Validation = Accuracy(repRF_Validation,dataset_Validation_selection$MACE)
+Kappa_RF_Validation = kappa2(ratings = cbind(repRF_Validation,dataset_Validation_selection$MACE))
+Kappa_RF_Validation = Kappa_RF_Validation$value
+balanced_accuracy_RF_Validation = (sensitivity_RF_Validation+specificity_RF_Validation)/2
+cMatrix_RF_Validation <- confusionMatrix(data=as.factor(repRF_Validation), reference = as.factor(dataset_Validation_selection$MACE), positive = '1')
+cMatrix_RF_Validation
+
+ci.auc(dataset_Validation_selection$MACE, prob_NN_Validation) 
+sensitivity_NN_Validation <- Sensitivity(dataset_Validation_selection$MACE, repNN_Validation, positive = "1")
+specificity_NN_Validation <- Specificity(dataset_Validation_selection$MACE, repNN_Validation, positive = "1")
+precision_NN_Validation <- Precision(dataset_Validation_selection$MACE, repNN_Validation, positive = "1")
+Brier_NN_Validation <- BrierScore(dataset_Validation_selection$MACE, prob_NN_Validation)
+accuracy_NN_Validation = Accuracy(repNN_Validation,dataset_Validation_selection$MACE)
+Kappa_NN_Validation = kappa2(ratings = cbind(repNN_Validation,dataset_Validation_selection$MACE))
+Kappa_NN_Validation = Kappa_NN_Validation$value
+balanced_accuracy_NN_Validation = (sensitivity_NN_Validation+specificity_NN_Validation)/2
+
+cMatrix_NN_Validation <- confusionMatrix(data=as.factor(repNN_Validation), reference = as.factor(dataset_Validation_selection$MACE), positive = '1')
+cMatrix_NN_Validation
+
+
+```
+
+## Test 1 = Lariboisière
+```{r}
+MACE_Test_1 <- dataset_Test_1_selection$MACE
+
+probGLM_Test1 = predict(resGLM, newdata=dataset_Test_1_selection, type = "response") 
+repGLM_Test1 = ifelse(probGLM_Test1 >= best_threshold_GLM,1,0) 
+
+probRF_Test1 = predict(resRanger, newdata=dataset_Test_1_selection, type = "prob")
+probRF_Test1 = probRF_Test1[,2]
+repRF_Test1 = ifelse(probRF_Test1 >= best_threshold_RF,1,0)
+
+probXGB_Test1 = predict(xgb_model,newdata=dataset_Test_1_selection, type="prob")
+probXGB_Test1 = probXGB_Test1[,2]
+repXGB_Test1 = ifelse(probXGB_Test1 >= best_threshold_XGB,1,0)
+
+prob_MFP_Test1 = predict(MFP_glm, newdata=dataset_Test_1_selection, type="response")
+prob_MFP_Test1 <- as.numeric(prob_MFP_Test1)
+repMFP_Test1 = ifelse(prob_MFP_Test1 >= best_threshold_MFP,1,0)
+
+prob_NN_Test1 = predict(resNN, newdata=dataset_Test_1_selection, type="prob")
+prob_NN_Test1 <- prob_NN_Test1[,2]
+repNN_Test1 = ifelse(prob_NN_Test1 >= best_threshold_NN,1,0)
+
+auc_glm_Test1 <- round(auc(dataset_Test_1_selection$MACE, probGLM_Test1),4) #0.843 -5
+auc_RF_ranger_Test1 <- round(auc(dataset_Test_1_selection$MACE, probRF_Test1),4) #0.8429 -6
+auc_xgb_Test1 <- round(auc(dataset_Test_1_selection$MACE, probXGB_Test1),4) #0.8546 -1
+auc_MFP_Test1 <- round(auc(dataset_Test_1_selection$MACE, prob_MFP_Test1),4) #0.8497 -3
+auc_nn_Test1 <- round(auc(dataset_Test_1_selection$MACE, prob_NN_Test1),4) #0.8375
+
+PR_auc_glm_Test1 <- PRAUC(y_pred = probGLM_Test1, y_true = dataset_Test_1_selection$MACE) #0.5001 -6
+PR_auc_RF_ranger_Test1 <- PRAUC(y_pred = probRF_Test1, y_true = dataset_Test_1_selection$MACE) #0.5617 -4
+PR_auc_xgb_Test1 <- PRAUC(y_pred = probXGB_Test1, y_true = dataset_Test_1_selection$MACE) #0.5828 -1
+PR_auc_MFP_Test1 <- PRAUC(y_pred = prob_MFP_Test1, y_true = dataset_Test_1_selection$MACE) #0.5142 -5
+PR_auc_nn_Test1 <- PRAUC(y_pred = prob_NN_Test1, y_true = dataset_Test_1_selection$MACE) #0.545
+
+f1_GLM_Test1 <- F1_Score(y_pred = repGLM_Test1, y_true = dataset_Test_1_selection$MACE,positive="1")
+f1_Ranger_Test1 <- F1_Score(y_pred = repRF_Test1, y_true = dataset_Test_1_selection$MACE,positive="1")
+f1_XGB_Test1 <- F1_Score(y_pred = repXGB_Test1, y_true = dataset_Test_1_selection$MACE,positive="1")
+f1_MFP_Test1 <- F1_Score(y_pred = repMFP_Test1, y_true = dataset_Test_1_selection$MACE,positive="1")
+f1_nn_Test1 <- F1_Score(y_pred = repNN_Test1, y_true = dataset_Test_1_selection$MACE,positive="1")
+
+ci.auc(dataset_Test_1_selection$MACE, probXGB_Test1) 
+sensitivity_XGB_Test1 <- Sensitivity(dataset_Test_1_selection$MACE, repXGB_Test1, positive = "1")
+specificity_XGB_Test1 <- Specificity(dataset_Test_1_selection$MACE, repXGB_Test1, positive = "1")
+precision_XGB_Test1 <- Precision(dataset_Test_1_selection$MACE, repXGB_Test1, positive = "1")
+Brier_XGB_Test1 <- BrierScore(dataset_Test_1_selection$MACE, probXGB_Test1)
+accuracy_XGB_Test1 = Accuracy(repXGB_Test1,dataset_Test_1_selection$MACE)
+Kappa_XGB_Test1 = kappa2(ratings = cbind(repXGB_Test1,dataset_Test_1_selection$MACE))
+Kappa_XGB_Test1 = Kappa_XGB_Test1$value
+balanced_accuracy_XGB_Test1 = (sensitivity_XGB_Test1+specificity_XGB_Test1)/2
+cMatrix_XGB_Test1 <- confusionMatrix(data=as.factor(repXGB_Test1), reference = as.factor(dataset_Test_1_selection$MACE), positive = '1')
+cMatrix_XGB_Test1
+
+ci.auc(dataset_Test_1_selection$MACE, probGLM_Test1) 
+sensitivity_GLM_Test1 <- Sensitivity(dataset_Test_1_selection$MACE, repGLM_Test1, positive = "1")
+specificity_GLM_Test1 <- Specificity(dataset_Test_1_selection$MACE, repGLM_Test1, positive = "1")
+precision_GLM_Test1 <- Precision(dataset_Test_1_selection$MACE, repGLM_Test1, positive = "1")
+Brier_GLM_Test1 <- BrierScore(dataset_Test_1_selection$MACE, probGLM_Test1)
+accuracy_GLM_Test1 = Accuracy(repGLM_Test1,dataset_Test_1_selection$MACE)
+Kappa_GLM_Test1 = kappa2(ratings = cbind(repGLM_Test1,dataset_Test_1_selection$MACE))
+Kappa_GLM_Test1 = Kappa_GLM_Test1$value
+balanced_accuracy_GLM_Test1 = (sensitivity_GLM_Test1+specificity_GLM_Test1)/2
+cMatrix_GLM_Test1 <- confusionMatrix(data=as.factor(repGLM_Test1), reference = as.factor(dataset_Test_1_selection$MACE), positive = '1')
+cMatrix_GLM_Test1
+
+ci.auc(dataset_Test_1_selection$MACE, prob_MFP_Test1) 
+sensitivity_MFP_Test1 <- Sensitivity(dataset_Test_1_selection$MACE, repMFP_Test1, positive = "1")
+specificity_MFP_Test1 <- Specificity(dataset_Test_1_selection$MACE, repMFP_Test1, positive = "1")
+precision_MFP_Test1 <- Precision(dataset_Test_1_selection$MACE, repMFP_Test1, positive = "1")
+Brier_MFP_Test1 <- BrierScore(dataset_Test_1_selection$MACE, prob_MFP_Test1)
+accuracy_MFP_Test1 = Accuracy(repMFP_Test1,dataset_Test_1_selection$MACE)
+Kappa_MFP_Test1 = kappa2(ratings = cbind(repMFP_Test1,dataset_Test_1_selection$MACE))
+Kappa_MFP_Test1 = Kappa_MFP_Test1$value
+balanced_accuracy_MFP_Test1 = (sensitivity_MFP_Test1+specificity_MFP_Test1)/2
+cMatrix_MFP_Test1 <- confusionMatrix(data=as.factor(repMFP_Test1), reference = as.factor(dataset_Test_1_selection$MACE), positive = '1')
+cMatrix_MFP_Test1
+
+ci.auc(dataset_Test_1_selection$MACE, probRF_Test1) 
+sensitivity_RF_Test1 <- Sensitivity(dataset_Test_1_selection$MACE, repRF_Test1, positive = "1")
+specificity_RF_Test1 <- Specificity(dataset_Test_1_selection$MACE, repRF_Test1, positive = "1")
+precision_RF_Test1 <- Precision(dataset_Test_1_selection$MACE, repRF_Test1, positive = "1")
+Brier_RF_Test1 <- BrierScore(dataset_Test_1_selection$MACE, probRF_Test1)
+accuracy_RF_Test1 = Accuracy(repRF_Test1,dataset_Test_1_selection$MACE)
+Kappa_RF_Test1 = kappa2(ratings = cbind(repRF_Test1,dataset_Test_1_selection$MACE))
+Kappa_RF_Test1 = Kappa_RF_Test1$value
+balanced_accuracy_RF_Test1 = (sensitivity_RF_Test1+specificity_RF_Test1)/2
+cMatrix_RF_Test1 <- confusionMatrix(data=as.factor(repRF_Test1), reference = as.factor(dataset_Test_1_selection$MACE), positive = '1')
+cMatrix_RF_Test1
+
+ci.auc(dataset_Test_1_selection$MACE, prob_NN_Test1) 
+sensitivity_NN_Test1 <- Sensitivity(dataset_Test_1_selection$MACE, repNN_Test1, positive = "1")
+specificity_NN_Test1 <- Specificity(dataset_Test_1_selection$MACE, repNN_Test1, positive = "1")
+precision_NN_Test1 <- Precision(dataset_Test_1_selection$MACE, repNN_Test1, positive = "1")
+Brier_NN_Test1 <- BrierScore(dataset_Test_1_selection$MACE, prob_NN_Test1)
+accuracy_NN_Test1 = Accuracy(repNN_Test1,dataset_Test_1_selection$MACE)
+Kappa_NN_Test1 = kappa2(ratings = cbind(repNN_Test1,dataset_Test_1_selection$MACE))
+Kappa_NN_Test1 = Kappa_NN_Test1$value
+balanced_accuracy_NN_Test1 = (sensitivity_NN_Test1+specificity_NN_Test1)/2
+cMatrix_NN_Test1 <- confusionMatrix(data=as.factor(repNN_Test1), reference = as.factor(dataset_Test_1_selection$MACE), positive = '1')
+cMatrix_NN_Test1
+```
+
+
+## Test 2 = Hôpital Américain
+```{r}
+MACE_Test_2 <- dataset_Test_2_selection$MACE
+
+probGLM_Test2 = predict(resGLM, newdata=dataset_Test_2_selection, type = "response") 
+repGLM_Test2 = ifelse(probGLM_Test2 >= best_threshold_GLM,1,0) 
+
+probRF_Test2 = predict(resRanger, newdata=dataset_Test_2_selection, type = "prob")
+probRF_Test2 = probRF_Test2[,2]
+repRF_Test2 = ifelse(probRF_Test2 >= best_threshold_RF,1,0)
+
+probXGB_Test2 = predict(xgb_model,newdata=dataset_Test_2_selection, type="prob")
+probXGB_Test2 = probXGB_Test2[,2]
+repXGB_Test2 = ifelse(probXGB_Test2 >= best_threshold_XGB,1,0)
+
+prob_MFP_Test2 = predict(MFP_glm, newdata=dataset_Test_2_selection, type="response")
+prob_MFP_Test2 <- as.numeric(prob_MFP_Test2)
+repMFP_Test2 = ifelse(prob_MFP_Test2 >= best_threshold_MFP,1,0)
+
+prob_NN_Test2 = predict(resNN, newdata=dataset_Test_2_selection, type="prob")
+prob_NN_Test2 <- prob_NN_Test2[,2]
+repNN_Test2 = ifelse(prob_NN_Test2 >= best_threshold_NN,1,0)
+
+auc_glm_Test2 <- round(auc(dataset_Test_2_selection$MACE, probGLM_Test2),4) #0.843 -5
+auc_RF_ranger_Test2 <- round(auc(dataset_Test_2_selection$MACE, probRF_Test2),4) #0.8429 -6
+auc_xgb_Test2 <- round(auc(dataset_Test_2_selection$MACE, probXGB_Test2),4) #0.8546 -1
+auc_MFP_Test2 <- round(auc(dataset_Test_2_selection$MACE, prob_MFP_Test2),4) #0.8497 -3
+auc_nn_Test2 <- round(auc(dataset_Test_2_selection$MACE, prob_NN_Test2),4) #0.8375
+
+PR_auc_glm_Test2 <- PRAUC(y_pred = probGLM_Test2, y_true = dataset_Test_2_selection$MACE) #0.5001 -6
+PR_auc_RF_ranger_Test2 <- PRAUC(y_pred = probRF_Test2, y_true = dataset_Test_2_selection$MACE) #0.5617 -4
+PR_auc_xgb_Test2 <- PRAUC(y_pred = probXGB_Test2, y_true = dataset_Test_2_selection$MACE) #0.5828 -1
+PR_auc_MFP_Test2 <- PRAUC(y_pred = prob_MFP_Test2, y_true = dataset_Test_2_selection$MACE) #0.5142 -5
+PR_auc_nn_Test2 <- PRAUC(y_pred = prob_NN_Test2, y_true = dataset_Test_2_selection$MACE) #0.545
+
+f1_GLM_Test2 <- F1_Score(y_pred = repGLM_Test2, y_true = dataset_Test_2_selection$MACE,positive="1")
+f1_Ranger_Test2 <- F1_Score(y_pred = repRF_Test2, y_true = dataset_Test_2_selection$MACE,positive="1")
+f1_XGB_Test2 <- F1_Score(y_pred = repXGB_Test2, y_true = dataset_Test_2_selection$MACE,positive="1")
+f1_MFP_Test2 <- F1_Score(y_pred = repMFP_Test2, y_true = dataset_Test_2_selection$MACE,positive="1")
+f1_nn_Test2 <- F1_Score(y_pred = repNN_Test2, y_true = dataset_Test_2_selection$MACE,positive="1")
+
+ci.auc(dataset_Test_2_selection$MACE, probXGB_Test2) 
+sensitivity_XGB_Test2 <- Sensitivity(dataset_Test_2_selection$MACE, repXGB_Test2, positive = "1")
+specificity_XGB_Test2 <- Specificity(dataset_Test_2_selection$MACE, repXGB_Test2, positive = "1")
+precision_XGB_Test2 <- Precision(dataset_Test_2_selection$MACE, repXGB_Test2, positive = "1")
+Brier_XGB_Test2 <- BrierScore(dataset_Test_2_selection$MACE, probXGB_Test2)
+accuracy_XGB_Test2 = Accuracy(repXGB_Test2,dataset_Test_2_selection$MACE)
+Kappa_XGB_Test2 = kappa2(ratings = cbind(repXGB_Test2,dataset_Test_2_selection$MACE))
+Kappa_XGB_Test2 = Kappa_XGB_Test2$value
+balanced_accuracy_XGB_Test2 = (sensitivity_XGB_Test2+specificity_XGB_Test2)/2
+cMatrix_XGB_Test2 <- confusionMatrix(data=as.factor(repXGB_Test2), reference = as.factor(dataset_Test_2_selection$MACE), positive = '1')
+cMatrix_XGB_Test2
+
+ci.auc(dataset_Test_2_selection$MACE, probGLM_Test2) 
+sensitivity_GLM_Test2 <- Sensitivity(dataset_Test_2_selection$MACE, repGLM_Test2, positive = "1")
+specificity_GLM_Test2 <- Specificity(dataset_Test_2_selection$MACE, repGLM_Test2, positive = "1")
+precision_GLM_Test2 <- Precision(dataset_Test_2_selection$MACE, repGLM_Test2, positive = "1")
+Brier_GLM_Test2 <- BrierScore(dataset_Test_2_selection$MACE, probGLM_Test2)
+accuracy_GLM_Test2 = Accuracy(repGLM_Test2,dataset_Test_2_selection$MACE)
+Kappa_GLM_Test2 = kappa2(ratings = cbind(repGLM_Test2,dataset_Test_2_selection$MACE))
+Kappa_GLM_Test2 = Kappa_GLM_Test2$value
+balanced_accuracy_GLM_Test2 = (sensitivity_GLM_Test2+specificity_GLM_Test2)/2
+cMatrix_GLM_Test2 <- confusionMatrix(data=as.factor(repGLM_Test2), reference = as.factor(dataset_Test_2_selection$MACE), positive = '1')
+cMatrix_GLM_Test2
+
+ci.auc(dataset_Test_2_selection$MACE, prob_MFP_Test2) 
+sensitivity_MFP_Test2 <- Sensitivity(dataset_Test_2_selection$MACE, repMFP_Test2, positive = "1")
+specificity_MFP_Test2 <- Specificity(dataset_Test_2_selection$MACE, repMFP_Test2, positive = "1")
+precision_MFP_Test2 <- Precision(dataset_Test_2_selection$MACE, repMFP_Test2, positive = "1")
+Brier_MFP_Test2 <- BrierScore(dataset_Test_2_selection$MACE, prob_MFP_Test2)
+accuracy_MFP_Test2 = Accuracy(repMFP_Test2,dataset_Test_2_selection$MACE)
+Kappa_MFP_Test2 = kappa2(ratings = cbind(repMFP_Test2,dataset_Test_2_selection$MACE))
+Kappa_MFP_Test2 = Kappa_MFP_Test2$value
+balanced_accuracy_MFP_Test2 = (sensitivity_MFP_Test2+specificity_MFP_Test2)/2
+cMatrix_MFP_Test2 <- confusionMatrix(data=as.factor(repMFP_Test2), reference = as.factor(dataset_Test_2_selection$MACE), positive = '1')
+cMatrix_MFP_Test2
+
+ci.auc(dataset_Test_2_selection$MACE, probRF_Test2) 
+sensitivity_RF_Test2 <- Sensitivity(dataset_Test_2_selection$MACE, repRF_Test2, positive = "1")
+specificity_RF_Test2 <- Specificity(dataset_Test_2_selection$MACE, repRF_Test2, positive = "1")
+precision_RF_Test2 <- Precision(dataset_Test_2_selection$MACE, repRF_Test2, positive = "1")
+Brier_RF_Test2 <- BrierScore(dataset_Test_2_selection$MACE, probRF_Test2)
+accuracy_RF_Test2 = Accuracy(repRF_Test2,dataset_Test_2_selection$MACE)
+Kappa_RF_Test2 = kappa2(ratings = cbind(repRF_Test2,dataset_Test_2_selection$MACE))
+Kappa_RF_Test2 = Kappa_RF_Test2$value
+balanced_accuracy_RF_Test2 = (sensitivity_RF_Test2+specificity_RF_Test2)/2
+cMatrix_RF_Test2 <- confusionMatrix(data=as.factor(repRF_Test2), reference = as.factor(dataset_Test_2_selection$MACE), positive = '1')
+cMatrix_RF_Test2
+
+ci.auc(dataset_Test_2_selection$MACE, prob_NN_Test2) 
+sensitivity_NN_Test2 <- Sensitivity(dataset_Test_2_selection$MACE, repNN_Test2, positive = "1")
+specificity_NN_Test2 <- Specificity(dataset_Test_2_selection$MACE, repNN_Test2, positive = "1")
+precision_NN_Test2 <- Precision(dataset_Test_2_selection$MACE, repNN_Test2, positive = "1")
+Brier_NN_Test2 <- BrierScore(dataset_Test_2_selection$MACE, prob_NN_Test2)
+accuracy_NN_Test2 = Accuracy(repNN_Test2,dataset_Test_2_selection$MACE)
+Kappa_NN_Test2 = kappa2(ratings = cbind(repNN_Test2,dataset_Test_2_selection$MACE))
+Kappa_NN_Test2 = Kappa_NN_Test2$value
+balanced_accuracy_NN_Test2 = (sensitivity_NN_Test2+specificity_NN_Test2)/2
+cMatrix_NN_Test2 <- confusionMatrix(data=as.factor(repNN_Test2), reference = as.factor(dataset_Test_2_selection$MACE), positive = '1')
+cMatrix_NN_Test2
+
+
+```
+# ROC and PR curves
+
+## All ML models (on ICPS Test Set)
+
+### ROC 
+```{r}
+rocobj_xgb <- roc(dataset_Validation_selection$MACE, probXGB_Validation, main = "Smoothing")
+rocobj_glm <- roc(dataset_Validation_selection$MACE, probGLM_Validation, main = "Smoothing")
+rocobj_RF_ranger <- roc(dataset_Validation_selection$MACE, probRF_Validation, main = "Smoothing")
+rocobj_MFP <- roc(dataset_Validation_selection$MACE, prob_MFP_Validation, main = "Smoothing")
+rocobj_nn <- roc(dataset_Validation_selection$MACE, prob_NN_Validation, main = "Smoothing")
+
+rocobj1 <- rocobj_glm
+rocobj2 <- rocobj_MFP
+rocobj3 <- rocobj_RF_ranger
+rocobj4 <- rocobj_xgb
+rocobj5<- rocobj_nn
+
+roclist <- list("XGBoost - AUC = 0.85" = rocobj4,
+                "MFP - AUC = 0.85" = rocobj2,
+                "GLM - AUC = 0.84" = rocobj1,
+                "RF Ranger - AUC = 0.84" = rocobj3,
+                "Neural Network - AUC = 0.84" = rocobj5)
+
+
+# GRAPHCIS - AUC (Solenn)
+g <- ggroc(roclist, aes = "colour", legacy.axes = TRUE) + geom_line(size = 0.8) +
+  theme_classic()+
+  ggtitle("Title") +
+  labs(x = "1 - Specificity",
+       y = "Sensitivity") +
+  coord_fixed(ratio = 1) +  # This will make the plot square
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 14, hjust = 0.5),
+    plot.subtitle = element_text(size = 12, hjust = 0.5),
+    panel.border = element_rect(linetype = "solid", color = "black", size = 1, fill = NA), # Ajout d'un cadre noir
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    axis.text.x = element_text(size = 12),  # Increase size of X axis labels
+    axis.text.y = element_text(size = 12),  # Increase size of Y axis labels
+    axis.title.x = element_text(size = 14),  # Increase size of X axis title
+    axis.title.y = element_text(size = 14),  # Increase size of Y axis title
+    legend.position = "bottom", # Set the legend box outside the main frame
+    legend.direction = "horizontal",
+    legend.box = "horizontal",
+    legend.margin = margin(t = 10, b = 10, unit = "pt"),
+    legend.text = element_text(size = 12),
+    legend.justification = c(1, 0),  # Set the justification to bottom-right
+    legend.box.just = "right",  # Set the legend box justification to right
+    legend.title = element_blank(),  # Remove legend title
+    legend.box.background = element_rect(color = "black", fill = NA)) +  # Add black border
+
+  scale_colour_manual(values = c("#cc0066", "#00cc00", "#ff8000","#9933ff","#000000"))
+
+
+# Add the y = x line (line of equality)
+g <- g + geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "black")
+g
+
+```
+
+### PR 
+```{r}
+rocobj1 <- rocobj_glm
+rocobj2 <- rocobj_MFP
+rocobj3 <- rocobj_RF_ranger
+rocobj4 <- rocobj_xgb
+rocobj5 <- rocobj_nn
+
+PR_auc_glm <- PRAUC(y_pred = probGLM_Validation, y_true = dataset_Validation_selection$MACE) #0.5001 -5
+PR_auc_RF_ranger <- PRAUC(y_pred = probRF_Validation, y_true = dataset_Validation_selection$MACE) #0.5617 -2
+PR_auc_xgb <- PRAUC(y_pred = probXGB_Validation, y_true = dataset_Validation_selection$MACE) #0.5828 -1
+PR_auc_MFP <- PRAUC(y_pred = prob_MFP_Validation, y_true = dataset_Validation_selection$MACE) #0.5142 -4
+PR_auc_nn <- PRAUC(y_pred = prob_NN_Validation, y_true = dataset_Validation_selection$MACE) #0.55 -3
+
+plot(precision ~ recall, coords(rocobj4, "all", ret = c("precision", "recall")), xlab = "Recall",ylab = "Precision", lwd = 2, type="l", col = c("#cc0066"), ylim = c(0,1),las = 1)
+lines(precision ~ recall, coords(rocobj3, "all", ret = c("precision", "recall")), xlab = "Recall",ylab = "Precision", lwd = 2, type="l", col = c("#9933ff"))
+lines(precision ~ recall, coords(rocobj2, "all", ret = c("precision", "recall")), xlab = "Recall",ylab = "Precision", lwd = 2, type="l", col = "#00cc00") 
+lines(precision ~ recall, coords(rocobj1, "all", ret = c("precision", "recall")), xlab = "Recall",ylab = "Precision", lwd = 2, type="l", col = "#ff8000") 
+lines(precision ~ recall, coords(rocobj5, "all", ret = c("precision", "recall")), xlab = "Recall",ylab = "Precision", lwd = 2, type="l", col = "#000000") 
+abline(h = 0.13, lty = 2, col = "#000000")
+
+
+legend(0.01, 0.4, legend=c("XGBoost - AUC PR = 0.59", "RF Ranger - AUC PR = 0.56",
+                        "Neural network - AUC PR = 0.55", 
+                        "MFP - AUC PR = 0.51", "GLM - AUC PR = 0.50"),cex = 0.9, 
+       fill = c("#cc0066","#9933ff","#000000","#00cc00","#ff8000"))
+```
+
+## XGBoost in all datasets
+### ROC 
+```{r}
+probXGB_Train = predict(xgb_model,newdata=dataset_train_XGB, type="prob")
+probXGB_Train = probXGB_Train[,2]
+
+probXGB_Validation = predict(xgb_model,newdata=dataset_Validation_selection, type="prob")
+probXGB_Validation = probXGB_Validation[,2]
+
+probXGB_Test_1 = predict(xgb_model,newdata=dataset_Test_1_selection, type="prob")
+probXGB_Test_1 = probXGB_Test_1[,2]
+
+probXGB_Test_2 = predict(xgb_model,newdata=dataset_Test_2_selection, type="prob")
+probXGB_Test_2 = probXGB_Test_2[,2]
+
+rocobj_xgb_Train <- roc(dataset_train_XGB$MACE, probXGB_Train, main = "Smoothing")
+rocobj_xgb_Validation <- roc(dataset_Validation_selection$MACE, probXGB_Validation, main = "Smoothing")
+rocobj_xgb_Test_1 <- roc(dataset_Test_1_selection$MACE, probXGB_Test_1, main = "Smoothing")
+rocobj_xgb_Test_2 <- roc(dataset_Test_2_selection$MACE, probXGB_Test_2, main = "Smoothing")
+
+auc_xgb_Train <- round(auc(dataset_train_XGB$MACE, probXGB_Train),4) 
+auc_xgb_Validation <- round(auc(dataset_Validation_selection$MACE, probXGB_Validation),4) 
+auc_xgb_Test1 <- round(auc(dataset_Test_1_selection$MACE, probXGB_Test_1),4) 
+auc_xgb_Test2 <- round(auc(dataset_Test_2_selection$MACE, probXGB_Test_2),4) 
+
+roclist <- list("Training dataset - AUC = 0.87" = rocobj_xgb_Train,
+                "Validation dataset - AUC = 0.86" = rocobj_xgb_Validation,
+                "Test dataset 1 - AUC = 0.84" = rocobj_xgb_Test_1,
+                "Test dataset 2 - AUC = 0.92" = rocobj_xgb_Test_2)
+
+g <- ggroc(roclist, aes = "colour", legacy.axes = TRUE) + geom_line(size = 0.8) +
+  theme_classic()+
+  ggtitle("Title") +
+  labs(x = "1 - Specificity",
+       y = "Sensitivity") +
+  coord_fixed(ratio = 1) +  # This will make the plot square
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 14, hjust = 0.5),
+    plot.subtitle = element_text(size = 12, hjust = 0.5),
+    panel.border = element_rect(linetype = "solid", color = "black", size = 1, fill = NA), # Ajout d'un cadre noir
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    axis.text.x = element_text(size = 12),  # Increase size of X axis labels
+    axis.text.y = element_text(size = 12),  # Increase size of Y axis labels
+    axis.title.x = element_text(size = 14),  # Increase size of X axis title
+    axis.title.y = element_text(size = 14),  # Increase size of Y axis title
+    legend.position = "bottom", # Set the legend box outside the main frame
+    legend.direction = "horizontal",
+    legend.box = "horizontal",
+    legend.margin = margin(t = 10, b = 10, unit = "pt"),
+    legend.text = element_text(size = 12),
+    legend.justification = c(1, 0),  # Set the justification to bottom-right
+    legend.box.just = "right",  # Set the legend box justification to right
+    legend.title = element_blank(),  # Remove legend title
+    legend.box.background = element_rect(color = "black", fill = NA)) +  # Add black border
+
+  scale_colour_manual(values = c("#cc0066", "#00cc00", "#0080ff","#000000"))
+
+
+# Add the y = x line (line of equality)
+g <- g + geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "black")
+g
+
+
+```
+
+### PR 
+```{r}
+PR_auc_xgb_Train <- PRAUC(y_pred = probXGB_Train, y_true = dataset_train_XGB$MACE) #0.6737 
+PR_auc_xgb_Validation <- PRAUC(y_pred = probXGB_Validation, y_true = dataset_Validation_selection$MACE) #0.5890
+PR_auc_xgb_Test1 <- PRAUC(y_pred = probXGB_Test_1, y_true = dataset_Test_1_selection$MACE) #0.4958
+PR_auc_xgb_Test2 <- PRAUC(y_pred = probXGB_Test_2, y_true = dataset_Test_2_selection$MACE) #0.5283
+
+plot(precision ~ recall, coords(rocobj_xgb_Train, "all", ret = c("precision", "recall")), xlab = "Recall",ylab = "Precision", lwd = 2, type="l", col = c("#cc0066"), ylim = c(0,1), las = 1)
+lines(precision ~ recall, coords(rocobj_xgb_Validation, "all", ret = c("precision", "recall")), xlab = "Recall",ylab = "Precision", lwd = 2, type="l", col = c("#00cc00"))
+lines(precision ~ recall, coords(rocobj_xgb_Test_1, "all", ret = c("precision", "recall")), xlab = "Recall",ylab = "Precision", lwd = 2, type="l", col = "#0080ff") 
+lines(precision ~ recall, coords(rocobj_xgb_Test_2, "all", ret = c("precision", "recall")), xlab = "Recall",ylab = "Precision", lwd = 2, type="l", col = "#000000") 
+
+legend(0.01, 0.38, legend=c("Training dataset - AUC PR = 0.6693", "Testing dataset - AUC PR = 0.5948",
+                         "Validation dataset - AUC PR = 0.5061","Validation 2 dataset - AUC PR = 0.5283"), 
+       fill = c("#cc0066", "#00cc00", "#0080ff", "#000000"))
+```
+
+## XGBoost vs all scores in Validation Set (ICPS)
+
+### Performance metrics
+```{r}
+auc_C_CMR_10 <- round(auc(dataset_Validation$MACE, dataset_Validation$Score_C_CMR_10),2) 
+auc_FRS <- round(auc(dataset_Validation$MACE, dataset_Validation$score_FRS),2) 
+auc_Score_ESC <- round(auc(dataset_Validation$MACE, dataset_Validation$Score_ESC),2) 
+auc_QRISK3 <- round(auc(dataset_Validation$MACE, dataset_Validation$Score_QRISK3),2) 
+auc_Score_ML_CMR <- round(auc(dataset_Validation$MACE, dataset_Validation$Score_ML_CMR),2)  
+auc_Score_SIS <- round(auc(dataset_Validation$MACE, dataset_Validation$Score_SIS_2),2) 
+
+PR_auc_C_CMR_10 <- PRAUC(y_pred = dataset_Validation$Score_C_CMR_10, y_true = dataset_Validation$MACE) 
+PR_auc_FRS <- PRAUC(y_pred = dataset_Validation$score_FRS, y_true = dataset_Validation$MACE)  -5
+PR_auc_Score_ESC <- PRAUC(y_pred = dataset_Validation$Score_ESC, y_true = dataset_Validation$MACE)
+PR_auc_QRISK3 <- PRAUC(y_pred = dataset_Validation$Score_QRISK3, y_true = dataset_Validation$MACE)
+PR_auc_Score_ML_CMR <- PRAUC(y_pred = dataset_Validation$Score_ML_CMR, y_true = dataset_Validation$MACE)
+PR_auc_Score_SIS <- PRAUC(y_pred = dataset_Validation$Score_SIS_2, y_true = dataset_Validation$MACE) 
+
+# ESC
+resESC <- glm(MACE ~ Score_ESC, data = dataset_Train, family = "binomial")
+probESC_Train <- predict(resESC, newdata=dataset_Train, type="response")
+probESC_Train <- as.numeric(probESC_Train)
+best_threshold_ESC  <- get_best_threshold(y_true = dataset_Train$MACE, y_pred = probESC_Train)
+
+probESC_Validation = predict(resESC, newdata=dataset_Validation, type="response")
+probESC_Validation <- as.numeric(probESC_Validation)
+repESC_Validation = ifelse(probESC_Validation >= best_threshold_ESC,1,0)
+
+ci.auc(dataset_Validation$MACE, probESC_Validation) 
+sensitivity_ESC <- Sensitivity(dataset_Validation$MACE, repESC_Validation, positive = "1")
+specificity_ESC <- Specificity(dataset_Validation$MACE, repESC_Validation, positive = "1")
+precision_ESC <- Precision(dataset_Validation$MACE, repESC_Validation, positive = "1")
+Brier_ESC <- BrierScore(dataset_Validation$MACE, probESC_Validation)
+accuracy_ESC = Accuracy(repESC_Validation,dataset_Validation$MACE)
+Kappa_ESC = kappa2(ratings = cbind(repESC_Validation,dataset_Validation$MACE))
+Kappa_ESC = Kappa_ESC$value
+balanced_accuracy_ESC = (sensitivity_ESC+specificity_ESC)/2
+cMatrix_ESC <- confusionMatrix(data=as.factor(repESC_Validation), reference = as.factor(dataset_Validation$MACE), positive = '1')
+cMatrix_ESC
+f1_ESC <- F1_Score(y_pred = repESC_Validation, y_true = dataset_Validation$MACE,positive="1")
+
+# FRS
+resFRS <- glm(MACE ~ score_FRS, data = dataset_Train, family = "binomial")
+probFRS_Train <- predict(resFRS, newdata = dataset_Train, type="response")
+probFRS_Train <- as.numeric(probFRS_Train)
+best_threshold_FRS  <- get_best_threshold(y_true = dataset_Train$MACE, y_pred = probFRS_Train)
+
+probFRS_Validation = predict(resFRS, newdata = dataset_Validation, type="response")
+probFRS_Validation <- as.numeric(probFRS_Validation)
+repFRS_Validation = ifelse(probFRS_Validation >= best_threshold_FRS,1,0)
+
+ci.auc(dataset_Validation$MACE, probFRS_Validation) 
+sensitivity_FRS <- Sensitivity(dataset_Validation$MACE, repFRS_Validation, positive = "1")
+specificity_FRS <- Specificity(dataset_Validation$MACE, repFRS_Validation, positive = "1")
+precision_FRS <- Precision(dataset_Validation$MACE, repFRS_Validation, positive = "1")
+Brier_FRS <- BrierScore(dataset_Validation$MACE, probFRS_Validation)
+accuracy_FRS = Accuracy(repFRS_Validation,dataset_Validation$MACE)
+Kappa_FRS = kappa2(ratings = cbind(repFRS_Validation,dataset_Validation$MACE))
+Kappa_FRS = Kappa_FRS$value
+balanced_accuracy_FRS = (sensitivity_FRS+specificity_FRS)/2
+cMatrix_FRS <- confusionMatrix(data=as.factor(repFRS_Validation), reference = as.factor(dataset_Validation$MACE), positive = '1')
+cMatrix_FRS
+f1_FRS <- F1_Score(y_pred = repFRS_Validation, y_true = dataset_Validation$MACE,positive="1")
+
+# QRISK3 score
+resQRISK3 <- glm(MACE ~ Score_QRISK3, data = dataset_Train, family = "binomial")
+probQRISK3_Train <- predict(resQRISK3, newdata = dataset_Train, type="response")
+probQRISK3_Train <- as.numeric(probQRISK3_Train)
+best_threshold_QRISK3  <- get_best_threshold(y_true = dataset_Train$MACE, y_pred = probQRISK3_Train)
+
+probQRISK3_Validation = predict(resQRISK3, newdata = dataset_Validation, type="response")
+probQRISK3_Validation <- as.numeric(probQRISK3_Validation)
+repQRISK3_Validation = ifelse(probQRISK3_Validation >= best_threshold_QRISK3,1,0)
+
+ci.auc(dataset_Validation$MACE, probQRISK3_Validation) 
+sensitivity_QRISK3 <- Sensitivity(dataset_Validation$MACE, repQRISK3_Validation, positive = "1")
+specificity_QRISK3 <- Specificity(dataset_Validation$MACE, repQRISK3_Validation, positive = "1")
+precision_QRISK3 <- Precision(dataset_Validation$MACE, repQRISK3_Validation, positive = "1")
+Brier_QRISK3 <- BrierScore(dataset_Validation$MACE, probQRISK3_Validation)
+accuracy_QRISK3 = Accuracy(repQRISK3_Validation,dataset_Validation$MACE)
+Kappa_QRISK3 = kappa2(ratings = cbind(repQRISK3_Validation,dataset_Validation$MACE))
+Kappa_QRISK3 = Kappa_QRISK3$value
+balanced_accuracy_QRISK3 = (sensitivity_QRISK3+specificity_QRISK3)/2
+cMatrix_QRISK3 <- confusionMatrix(data=as.factor(repQRISK3_Validation), reference = as.factor(dataset_Validation$MACE), positive = '1')
+cMatrix_QRISK3
+f1_QRISK3 <- F1_Score(y_pred = repQRISK3_Validation, y_true = dataset_Validation$MACE,positive="1")
+
+# C-CMR-10 score
+resCMR10 <- glm(MACE ~ Score_C_CMR_10, data = dataset_Train, family = "binomial")
+probCMR10_Train = predict(resCMR10, newdata=dataset_Train, type="response")
+probCMR10_Train <- as.numeric(probCMR10_Train)
+best_threshold_CMR10  <- get_best_threshold(y_true = dataset_Train$MACE, y_pred = probCMR10_Train)
+
+probCMR10_Validation = predict(resCMR10, newdata = dataset_Validation, type="response")
+probCMR10_Validation <- as.numeric(probCMR10_Validation)
+repCMR10_Validation = ifelse(probCMR10_Validation >= best_threshold_CMR10,1,0)
+
+ci.auc(dataset_Validation$MACE, probCMR10_Validation) 
+sensitivity_CMR10 <- Sensitivity(dataset_Validation$MACE, repCMR10_Validation, positive = "1")
+specificity_CMR10 <- Specificity(dataset_Validation$MACE, repCMR10_Validation, positive = "1")
+precision_CMR10 <- Precision(dataset_Validation$MACE, repCMR10_Validation, positive = "1")
+Brier_CMR10 <- BrierScore(dataset_Validation$MACE, probCMR10_Validation)
+accuracy_CMR10 = Accuracy(repCMR10_Validation,dataset_Validation$MACE)
+Kappa_CMR10 = kappa2(ratings = cbind(repCMR10_Validation,dataset_Validation$MACE))
+Kappa_CMR10 = Kappa_CMR10$value
+balanced_accuracy_CMR10 = (sensitivity_CMR10+specificity_CMR10)/2
+cMatrix_CMR10 <- confusionMatrix(data=as.factor(repCMR10_Validation), reference = as.factor(dataset_Validation$MACE), positive = '1')
+cMatrix_CMR10
+f1_CMR10 <- F1_Score(y_pred = repCMR10_Validation, y_true = dataset_Validation$MACE,positive="1")
+
+# SIS Score
+resSIS <- glm(MACE ~ Score_SIS_2, data = dataset_Train, family = "binomial")
+probSIS_Train = predict(resSIS, newdata = dataset_Train, type = "response")
+probSIS_Train <- as.numeric(probSIS_Train)
+best_threshold_SIS  <- get_best_threshold(y_true = dataset_Train$MACE, y_pred = probSIS_Train)
+
+probSIS_Validation = predict(resSIS, newdata = dataset_Validation, type = "response")
+probSIS_Validation <- as.numeric(probSIS_Validation)
+repSIS_Validation = ifelse(probSIS_Validation >= get_best_threshold(y_true = dataset_Validation$MACE, y_pred = probSIS_Validation),1,0)
+
+ci.auc(dataset_Validation$MACE, probSIS_Validation) 
+sensitivity_SIS <- Sensitivity(dataset_Validation$MACE, repSIS_Validation, positive = "1")
+specificity_SIS <- Specificity(dataset_Validation$MACE, repSIS_Validation, positive = "1")
+precision_SIS <- Precision(dataset_Validation$MACE, repSIS_Validation, positive = "1")
+Brier_SIS <- BrierScore(dataset_Validation$MACE, probSIS_Validation)
+accuracy_SIS = Accuracy(repSIS_Validation,dataset_Validation$MACE)
+Kappa_SIS = kappa2(ratings = cbind(repSIS_Validation,dataset_Validation$MACE))
+Kappa_SIS = Kappa_SIS$value
+balanced_accuracy_SIS = (sensitivity_SIS+specificity_SIS)/2
+cMatrix_SIS <- confusionMatrix(data=as.factor(repSIS_Validation), reference = as.factor(dataset_Validation$MACE), positive = '1')
+cMatrix_SIS
+f1_SIS <- F1_Score(y_pred = repSIS_Validation, y_true = dataset_Validation$MACE,positive="1")
+
+# Stress ML score
+resStressML <- glm(MACE ~ Score_ML_CMR, data = dataset_Train, family = "binomial")
+probStressML_Train = predict(resStressML, newdata=dataset_Train, type="response")
+probStressML_Train <- as.numeric(probStressML_Train)
+best_threshold_StressML  <- get_best_threshold(y_true = dataset_Train$MACE, y_pred = probStressML_Train)
+
+probStressML_Validation = predict(resStressML, newdata=dataset_Validation, type="response")
+probStressML_Validation <- as.numeric(probStressML_Validation)
+repStressML_Validation = ifelse(probStressML_Validation >= best_threshold_StressML,1,0)
+
+ci.auc(dataset_Validation$MACE, probStressML_Validation) 
+precision_StressML <- Precision(dataset_Validation$MACE, repStressML_Validation, positive = "1")
+Brier_StressML <- BrierScore(dataset_Validation$MACE, probStressML_Validation)
+accuracy_StressML = Accuracy(repStressML_Validation,dataset_Validation$MACE)
+Kappa_StressML = kappa2(ratings = cbind(repStressML_Validation,dataset_Validation$MACE))
+Kappa_StressML = Kappa_StressML$value
+balanced_accuracy_StressML = (sensitivity_StressML+specificity_StressML)/2
+ppv_StressML <- posPredValue(as.factor(dataset_Validation$MACE),as.factor(repStressML_Validation))
+npv_StressML <- negPredValue(as.factor(dataset_Validation$MACE),as.factor(repStressML_Validation))
+cMatrix_StressML <- confusionMatrix(data=as.factor(repStressML_Validation), reference = as.factor(dataset_Validation$MACE), positive = '1')
+cMatrix_StressML
+f1_StressML <- F1_Score(y_pred = repStressML_Validation, y_true = dataset_Validation$MACE,positive="1")
+
+```
+
+### ROC 
+```{r}
+
+rocobj_xgb <- roc(dataset_Validation$MACE, probXGB, main = "Smoothing")
+rocobj_ML_CMR_SCORE <- roc(dataset_Validation$MACE, dataset_Validation$Score_ML_CMR, main = "Smoothing")
+rocobj_FRS <- roc(dataset_Validation$MACE, dataset_Validation$score_FRS, main = "Smoothing")
+rocobj_ESC <- roc(dataset_Validation$MACE, dataset_Validation$Score_ESC, main = "Smoothing")
+rocobj_QRISK3 <- roc(dataset_Validation$MACE, dataset_Validation$Score_QRISK3, main = "Smoothing")
+rocobj_SIS <- roc(dataset_Validation$MACE, dataset_Validation$Score_SIS, main = "Smoothing")
+rocobj_C_CMR_10 <- roc(dataset_Validation$MACE, dataset_Validation$Score_C_CMR_10, main = "Smoothing")
+
+roclist <- list("XGBoost - AUC = 0.86" = rocobj_xgb,
+                "ML CMR score - AUC = 0.66" = rocobj_ML_CMR_SCORE,
+                "C-CMR-10 score - AUC = 0.62" = rocobj_C_CMR_10,
+                "QRISK3 score - AUC = 0.60" = rocobj_QRISK3,
+                "SIS score - AUC = 0.71" = rocobj_SIS,
+                "ESC score - AUC = 0.55" = rocobj_ESC,
+                "Framingham score - AUC = 0.50" = rocobj_FRS
+                )
+g <- ggroc(roclist, aes = "colour", legacy.axes = TRUE) + geom_line(size = 0.8) +
+  theme_classic()+
+  ggtitle("Title") +
+  labs(x = "1 - Specificity",
+       y = "Sensitivity") +
+  coord_fixed(ratio = 1) +  # This will make the plot square
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 14, hjust = 0.5),
+    plot.subtitle = element_text(size = 12, hjust = 0.5),
+    panel.border = element_rect(linetype = "solid", color = "black", size = 1, fill = NA), # Ajout d'un cadre noir
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    axis.text.x = element_text(size = 12),  # Increase size of X axis labels
+    axis.text.y = element_text(size = 12),  # Increase size of Y axis labels
+    axis.title.x = element_text(size = 14),  # Increase size of X axis title
+    axis.title.y = element_text(size = 14),  # Increase size of Y axis title
+    legend.position = "bottom", # Set the legend box outside the main frame
+    legend.direction = "horizontal",
+    legend.box = "horizontal",
+    legend.margin = margin(t = 10, b = 10, unit = "pt"),
+    legend.text = element_text(size = 12),
+    legend.justification = c(1, 0),  # Set the justification to bottom-right
+    legend.box.just = "right",  # Set the legend box justification to right
+    legend.title = element_blank(),  # Remove legend title
+    legend.box.background = element_rect(color = "black", fill = NA)) +  # Add black border
+
+  scale_colour_manual(values = c("#cc0066", "#FF9700","#FFE400","#16D300","#00B2BA","#003FC5","#A700C5"))
+
+
+# Add the y = x line (line of equality)
+g <- g + geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "black")
+g
+
+```
+
+### PR 
+```{r}
+rocobj_xgb <- roc(dataset_Validation_selection$MACE, probXGB, main = "Smoothing")
+rocobj_ML_CMR_SCORE <- roc(dataset_Validation_selection$MACE, dataset_Validation$Score_ML_CMR, main = "Smoothing")
+rocobj_FRS <- roc(dataset_Validation_selection$MACE, dataset_Validation$score_FRS, main = "Smoothing")
+rocobj_ESC <- roc(dataset_Validation_selection$MACE, dataset_Validation$Score_ESC, main = "Smoothing")
+rocobj_QRISK3 <- roc(dataset_Validation_selection$MACE, dataset_Validation$Score_QRISK3, main = "Smoothing")
+rocobj_SIS <- roc(dataset_Validation_selection$MACE, dataset_Validation$Score_SIS, main = "Smoothing")
+rocobj_C_CMR_10 <- roc(dataset_Validation_selection$MACE, dataset_Validation$Score_C_CMR_10, main = "Smoothing")
+
+PR_auc_C_CMR_10 <- PRAUC(y_pred = dataset_Validation$Score_C_CMR_10, y_true = dataset_Validation_selection$MACE) #0.20 -3
+PR_auc_FRS <- PRAUC(y_pred = dataset_Validation$score_FRS, y_true = dataset_Validation_selection$MACE) #0.1549 -5
+PR_auc_Score_ESC <- PRAUC(y_pred = dataset_Validation$Score_ESC, y_true = dataset_Validation_selection$MACE) #0.1879 -4
+PR_auc_QRISK3 <- PRAUC(y_pred = dataset_Validation$Score_QRISK3, y_true = dataset_Validation_selection$MACE) #0.1070 -6
+PR_auc_Score_ML_CMR <- PRAUC(y_pred = dataset_Validation$Score_ML_CMR, y_true = dataset_Validation_selection$MACE) #0.2857 -1
+PR_auc_Score_SIS <- PRAUC(y_pred = dataset_Validation$Score_SIS, y_true = dataset_Validation_selection$MACE) #0.2311 -2
+
+plot(precision ~ recall, coords(rocobj_xgb, "all", ret = c("precision", "recall")), xlab = "Recall",ylab = "Precision", lwd = 2, type="l", col = c("#cc0066"),ylim = c(0,1), las = 1)
+lines(precision ~ recall, coords(rocobj_ML_CMR_SCORE, "all", ret = c("precision", "recall")), xlab = "Recall",ylab = "Precision", lwd = 2, type="l", col = c("#FF9700"))
+lines(precision ~ recall, coords(rocobj_C_CMR_10, "all", ret = c("precision", "recall")), xlab = "Recall",ylab = "Precision", lwd = 2, type="l", col = "#FFE400") 
+lines(precision ~ recall, coords(rocobj_QRISK3, "all", ret = c("precision", "recall")), xlab = "Recall",ylab = "Precision", lwd = 2, type="l", col = "#16D300") 
+lines(precision ~ recall, coords(rocobj_SIS, "all", ret = c("precision", "recall")), xlab = "Recall",ylab = "Precision", lwd = 2, type="l", col = "#00B2BA") 
+lines(precision ~ recall, coords(rocobj_ESC, "all", ret = c("precision", "recall")), xlab = "Recall",ylab = "Precision", lwd = 2, type="l", col = "#003FC5") 
+lines(precision ~ recall, coords(rocobj_FRS, "all", ret = c("precision", "recall")), xlab = "Recall",ylab = "Precision", lwd = 2, type="l", col = "#A700C5") 
+abline(h = 0.13, lty = 2, col = "#000000")
+legend(0.43, 1, legend=c("XGBoost - AUC PR = 0.5948", "ML CMR score - AUC PR = 0.2857", "SIS score - AUC PR = 0.2311","C-CMR-10 score - AUC PR = 0.2000", "ESC score - AUC PR = 0.1879", "Framingham score - AUC PR = 0.1549", "QRISK3 score - AUC PR = 0.1070"), fill = c("#cc0066","#FF9700","#00B2BA","#FFE400","#003FC5","#A700C5","#16D300"))
+
+```
+
+## XGBoost with or without revascularization
+```{r}
+dataset_Validation_glm_revasc <- dataset_Validation %>%
+        select(MACE, Revascularization) %>%
+        mutate(XGBoost_model = probXGB_Validation)
+
+dataset_Train_glm_revasc <- dataset_Train %>%
+        select(MACE, Revascularization) %>%
+        mutate(XGBoost_model = probXGB_Train)
+
+resGLM_revasc <- glm(MACE ~., data = dataset_Train_glm_revasc, family = "binomial")
+
+probGLM_Revasc = predict(resGLM_revasc, newdata=dataset_Validation_glm_revasc, type = "response") 
+
+```
+
+### ROC 
+```{r}
+rocobj_xgb_Validation <- roc(dataset_Validation_selection$MACE, probXGB_Validation, main = "Smoothing")
+rocobj_glm_revasc_Validation <- roc(dataset_Validation_glm_revasc$MACE, probGLM_Revasc, main = "Smoothing")
+
+auc_xgb_Validation <- round(auc(dataset_Validation_selection$MACE, probXGB_Validation),4) #0.8531 
+auc_glm_revasc_Validation <- round(auc(dataset_Validation_glm_revasc$MACE, probGLM_Revasc),4) #0.8437
+
+
+roclist <- list("XGBoost - AUC = 0.86" = rocobj_xgb_Validation,
+                "XGBoost + Revasc - AUC = 0.85" = rocobj_glm_revasc_Validation)
+
+g <- ggroc(roclist, aes = "colour", legacy.axes = TRUE) + geom_line(size = 0.8) +
+  theme_classic()+
+  ggtitle("Title") +
+  labs(x = "1 - Specificity",
+       y = "Sensitivity") +
+  coord_fixed(ratio = 1) +  # This will make the plot square
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 14, hjust = 0.5),
+    plot.subtitle = element_text(size = 12, hjust = 0.5),
+    panel.border = element_rect(linetype = "solid", color = "black", size = 1, fill = NA), # Ajout d'un cadre noir
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    axis.text.x = element_text(size = 12),  # Increase size of X axis labels
+    axis.text.y = element_text(size = 12),  # Increase size of Y axis labels
+    axis.title.x = element_text(size = 14),  # Increase size of X axis title
+    axis.title.y = element_text(size = 14),  # Increase size of Y axis title
+    legend.position = "bottom", # Set the legend box outside the main frame
+    legend.direction = "horizontal",
+    legend.box = "horizontal",
+    legend.margin = margin(t = 10, b = 10, unit = "pt"),
+    legend.text = element_text(size = 12),
+    legend.justification = c(1, 0),  # Set the justification to bottom-right
+    legend.box.just = "right",  # Set the legend box justification to right
+    legend.title = element_blank(),  # Remove legend title
+    legend.box.background = element_rect(color = "black", fill = NA)) +  # Add black border
+
+  scale_colour_manual(values = c("#cc0066", "#00cc00"))
+
+
+# Add the y = x line (line of equality)
+g <- g + geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "black")
+g
+
+roc.test(rocobj_xgb_Validation,rocobj_glm_revasc_Validation,method = "delong")
+```
+
+### PR 
+```{r}
+PR_auc_xgb_Validation <- PRAUC(y_pred = probXGB_Validation, y_true = dataset_Validation_selection$MACE) 
+PR_auc_glm_revasc_Validation <- PRAUC(y_pred = probGLM_Revasc, y_true = dataset_Validation_glm_revasc$MACE) 
+
+PR_auc_xgb_Validation <- PRAUC(y_pred = probXGB_Validation, y_true = dataset_Validation_selection$MACE) 
+PR_auc_glm_revasc_Validation <- PRAUC(y_pred = probGLM_Revasc, y_true = dataset_Validation_glm_revasc$MACE) 
+
+plot(precision ~ recall, coords(rocobj_xgb_Validation, "all", ret = c("precision", "recall")), xlab = "Recall",ylab = "Precision", lwd = 2, type="l", col = c("#cc0066"), ylim = c(0,1), las = 1)
+lines(precision ~ recall, coords(rocobj_glm_revasc_Validation, "all", ret = c("precision", "recall")), xlab = "Recall",ylab = "Precision", lwd = 2, type="l", col = c("#00cc00"))
+abline(h = 0.13, lty = 2, col = "#000000")
+legend(0.01, 0.3, legend=c("XGBoost - AUC PR = 0.60", "XGBoost + Revasc - AUC PR = 0.59"), 
+       fill = c("#cc0066", "#00cc00"))
+
+
+```
+
+## XGBoost with or without clinical variables
+### Development of a new model including best clinical variables
+
+#### Step 1
+```{r}
+dataset_train_XGB_Clinical <- subset(dataset_Train,select = c(LVEF, Ischemia_Segments, LGE_Segments, MACE, Segments_Noncalcified_Plaques, Vessels_Obstructive_CAD, Proximal_Segments_Stenosis_Sup_50percent,Gender,Age,BMI,Dyslipidemia,Diabetes,Hypertension,Family_History_CAD))
+
+dataset_train_XGB_Clinical$Ischemia_Segments <- as.numeric(dataset_train_XGB_Clinical$Ischemia_Segments)
+dataset_train_XGB_Clinical$LGE_Segments <- as.numeric(dataset_train_XGB_Clinical$LGE_Segments)
+dataset_train_XGB_Clinical$LVEF <- as.numeric(dataset_train_XGB_Clinical$LVEF)
+dataset_train_XGB_Clinical$Proximal_Segments_Stenosis_Sup_50percent <- as.numeric(dataset_train_XGB_Clinical$Proximal_Segments_Stenosis_Sup_50percent)
+dataset_train_XGB_Clinical$Segments_Noncalcified_Plaques <- as.numeric(dataset_train_XGB_Clinical$Segments_Noncalcified_Plaques)
+dataset_train_XGB_Clinical$Vessels_Obstructive_CAD <- as.numeric(dataset_train_XGB_Clinical$Vessels_Obstructive_CAD)
+dataset_train_XGB_Clinical$MACE <- ifelse(dataset_train_XGB_Clinical$MACE == 0,"X0","X1")
+
+nrounds <- 1000
+
+# note to start nrounds from 200, as smaller learning rates result in errors so
+# big with lower starting points that they'll mess the scales
+tune_grid <- expand.grid(
+  nrounds = seq(from = 200, to = nrounds, by = 50),
+  eta = c(0.025, 0.05, 0.1, 0.3),
+  max_depth = c(2, 3, 4, 5, 6),
+  gamma = 0,
+  colsample_bytree = 1,
+  min_child_weight = 1,
+  subsample = 1
+)
+
+tune_control <- caret::trainControl(
+  method = "cv", # cross-validation
+  number = 3, # with n folds 
+  #index = createFolds(tr_treated$Id_clean), # fix the folds
+  verboseIter = FALSE, # no training log
+  allowParallel = TRUE, # FALSE for reproducible results
+  classProbs = TRUE
+)
+
+xgb_tune <- caret::train(
+  MACE ~ .,
+  data = dataset_train_XGB_Clinical,
+  trControl = tune_control,
+  tuneGrid = tune_grid,
+  method = "xgbTree",
+  verbose = TRUE,
+  metric = "ROC"
+)
+
+# helper function for the plots
+tuneplot <- function(x, probs = .90) {
+  ggplot(x)
+}
+
+tuneplot(xgb_tune)
+
+xgb_tune$bestTune
+
+```
+
+```{r}
+xgb_tune$bestTune
+```
+
+
+#### Step 2: Maximum Depth and Minimum Child Weight
+
+```{r}
+tune_grid2 <- expand.grid(
+  nrounds = seq(from = 50, to = nrounds, by = 50),
+  eta = xgb_tune$bestTune$eta,
+  max_depth = ifelse(xgb_tune$bestTune$max_depth == 2,
+    c(xgb_tune$bestTune$max_depth:4),
+    xgb_tune$bestTune$max_depth - 1:xgb_tune$bestTune$max_depth + 1),
+  gamma = 0,
+  colsample_bytree = 1,
+  min_child_weight = c(1, 2, 3),
+  subsample = 1
+)
+
+xgb_tune2 <- caret::train(
+  MACE ~ .,
+  data = dataset_train_XGB_Clinical,
+  trControl = tune_control,
+  tuneGrid = tune_grid2,
+  method = "xgbTree",
+  verbose = TRUE
+)
+
+tuneplot(xgb_tune2)
+```
+```{r}
+xgb_tune2$bestTune
+```
+
+#### Step 3: Column and Row Sampling
+
+```{r}
+tune_grid3 <- expand.grid(
+  nrounds = seq(from = 50, to = nrounds, by = 50),
+  eta = xgb_tune$bestTune$eta,
+  max_depth = xgb_tune2$bestTune$max_depth,
+  gamma = 0,
+  colsample_bytree = c(0.4, 0.6, 0.8, 1.0),
+  min_child_weight = xgb_tune2$bestTune$min_child_weight,
+  subsample = c(0.5, 0.75, 1.0)
+)
+
+xgb_tune3 <- caret::train(
+  MACE ~ .,
+  data = dataset_train_XGB_Clinical,
+  trControl = tune_control,
+  tuneGrid = tune_grid3,
+  method = "xgbTree",
+  verbose = TRUE
+)
+
+tuneplot(xgb_tune3, probs = .95)
+```
+
+```{r}
+xgb_tune3$bestTune
+
+```
+
+
+#### Step 4: Gamma
+
+```{r}
+tune_grid4 <- expand.grid(
+  nrounds = seq(from = 50, to = nrounds, by = 50),
+  eta = xgb_tune$bestTune$eta,
+  max_depth = xgb_tune2$bestTune$max_depth,
+  gamma = c(0, 0.05, 0.1, 0.5, 0.7, 0.9, 1.0),
+  colsample_bytree = xgb_tune3$bestTune$colsample_bytree,
+  min_child_weight = xgb_tune2$bestTune$min_child_weight,
+  subsample = xgb_tune3$bestTune$subsample
+)
+
+xgb_tune4 <- caret::train(
+  MACE ~ .,
+  data = dataset_train_XGB_Clinical,
+  trControl = tune_control,
+  tuneGrid = tune_grid4,
+  method = "xgbTree",
+  verbose = TRUE
+)
+
+tuneplot(xgb_tune4)
+```
+
+```{r}
+xgb_tune4$bestTune
+```
+#### Step 5: Reducing the Learning Rate
+Now, we have tuned the hyperparameters and can start reducing the learning rate to get to the final model:
+
+```{r}
+tune_grid5 <- expand.grid(
+  nrounds = seq(from = 100, to = 10000, by = 100),
+  eta = c(0.01, 0.015, 0.025, 0.05, 0.1),
+  max_depth = xgb_tune2$bestTune$max_depth,
+  gamma = xgb_tune4$bestTune$gamma,
+  colsample_bytree = xgb_tune3$bestTune$colsample_bytree,
+  min_child_weight = xgb_tune2$bestTune$min_child_weight,
+  subsample = xgb_tune3$bestTune$subsample
+)
+
+xgb_tune5 <- caret::train(
+  MACE ~ .,
+  data = dataset_train_XGB_Clinical,
+  trControl = tune_control,
+  tuneGrid = tune_grid5,
+  method = "xgbTree",
+  verbose = TRUE
+)
+
+tuneplot(xgb_tune5)
+```
+```{r}
+xgb_tune5$bestTune
+```
+
+```{r}
+ctrlspecs <- trainControl(method="cv", number=5)
+
+final_grid <- expand.grid(
+  nrounds = 100,
+  eta = 0.1,
+  max_depth = 3,
+  gamma = 0.5,
+  colsample_bytree = 0.8,
+  min_child_weight = 1,
+  subsample = 0.75)
+
+xgb_model_clinical <- train(
+  MACE ~ .,
+  data = dataset_train_XGB_Clinical,
+  trControl = ctrlspecs,
+  tuneGrid = final_grid,
+  method = "xgbTree",
+  verbose = TRUE
+)
+
+```
+
+### ROC 
+```{r}
+dataset_Validation_XGB_Clinical <- subset(dataset_Validation,select = c(LVEF, Ischemia_Segments, LGE_Segments, MACE, Segments_Noncalcified_Plaques, Vessels_Obstructive_CAD, Proximal_Segments_Stenosis_Sup_50percent,Gender,Age,BMI,Dyslipidemia,Diabetes,Hypertension,Family_History_CAD))
+
+probXGB_Validation = predict(xgb_model,newdata=dataset_Validation_XGB_Clinical, type="prob")
+probXGB_Validation = probXGB_Validation[,2]
+
+probXGB_Clinical = predict(xgb_model_clinical,newdata=dataset_Validation_XGB_Clinical, type="prob")
+probXGB_Clinical = probXGB_Clinical[,2]
+
+rocobj_xgb_Validation <- roc(dataset_Validation_selection$MACE, probXGB_Validation, main = "Smoothing")
+rocobj_xgb_Clinical <- roc(dataset_Validation_XGB_Clinical$MACE, probXGB_Clinical, main = "Smoothing")
+
+auc_xgb_Validation <- round(auc(dataset_Validation_selection$MACE, probXGB_Validation),4) #0.858
+auc_xgb_Clinical <- round(auc(dataset_Validation_XGB_Clinical$MACE, probXGB_Clinical),4) # 0.8659
+
+roclist <- list("XGBoost - AUC = 0.86" = rocobj_xgb_Validation,
+                "XGBoost + Clinical - AUC = 0.87" = rocobj_xgb_Clinical)
+
+g <- ggroc(roclist, aes = "colour", legacy.axes = TRUE) + geom_line(size = 0.8) +
+  theme_classic()+
+  ggtitle("Title") +
+  labs(x = "1 - Specificity",
+       y = "Sensitivity") +
+  coord_fixed(ratio = 1) +  # This will make the plot square
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 14, hjust = 0.5),
+    plot.subtitle = element_text(size = 12, hjust = 0.5),
+    panel.border = element_rect(linetype = "solid", color = "black", size = 1, fill = NA), # Ajout d'un cadre noir
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    axis.text.x = element_text(size = 12),  # Increase size of X axis labels
+    axis.text.y = element_text(size = 12),  # Increase size of Y axis labels
+    axis.title.x = element_text(size = 14),  # Increase size of X axis title
+    axis.title.y = element_text(size = 14),  # Increase size of Y axis title
+    legend.position = "bottom", # Set the legend box outside the main frame
+    legend.direction = "horizontal",
+    legend.box = "horizontal",
+    legend.margin = margin(t = 10, b = 10, unit = "pt"),
+    legend.text = element_text(size = 12),
+    legend.justification = c(1, 0),  # Set the justification to bottom-right
+    legend.box.just = "right",  # Set the legend box justification to right
+    legend.title = element_blank(),  # Remove legend title
+    legend.box.background = element_rect(color = "black", fill = NA)) +  # Add black border
+
+  scale_colour_manual(values = c("#cc0066", "#00cc00"))
+
+
+# Add the y = x line (line of equality)
+g <- g + geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "black")
+g
+
+roc.test(rocobj_xgb_Test,rocobj_xgb_Clinical,method = "delong")
+```
+
+
+### PR 
+```{r}
+PR_auc_xgb_Validation <- PRAUC(y_pred = probXGB_Validation, y_true = dataset_Validation_selection$MACE) #0.60
+PR_auc_xgb_Clinical <- PRAUC(y_pred = probXGB_Clinical, y_true = dataset_Validation_XGB_Clinical$MACE) #0.59
+
+plot(precision ~ recall, coords(rocobj_xgb_Validation, "all", ret = c("precision", "recall")), xlab = "Recall",ylab = "Precision", lwd = 2, type="l", col = c("#cc0066"), ylim = c(0,1), las = 1)
+lines(precision ~ recall, coords(rocobj_xgb_Clinical, "all", ret = c("precision", "recall")), xlab = "Recall",ylab = "Precision", lwd = 2, type="l", col = c("#00cc00"))
+abline(h = 0.13, lty = 2, col = "#000000")
+legend(0.01, 0.3, legend=c("XGBoost - AUC PR = 0.60", "XGBoost + Clinical - AUC PR = 0.59"), 
+       fill = c("#cc0066", "#00cc00"))
+
+
+```
+
+```{r}
+# Définition des couleurs
+couleur_xgb_Test <- "#cc0066"
+couleur_xgb_Clinical <- "#00cc00"
+
+# Calcul des AUC-PR
+auc_xgb_Test <- auc(rocobj_xgb_Test)
+auc_xgb_Clinical <- auc(rocobj_xgb_Clinical)
+
+# Création du graphique
+plot(precision ~ recall, coords(rocobj_xgb_Test, "all", ret = c("precision", "recall")), 
+     xlab = "Rappel", ylab = "Précision", lwd = 2, type = "l", col = couleur_xgb_Test, 
+     xlim = c(0, 1), ylim = c(0, 1), main = "Courbes ROC", xaxs = "i", cex = 1.2,
+     las = 1) # Ajout de las = 1 pour rendre les labels horizontaux dès le début
+lines(precision ~ recall, coords(rocobj_xgb_Clinical, "all", ret = c("precision", "recall")), 
+      lwd = 2, type = "l", col = couleur_xgb_Clinical)
+
+# Ajout des AUC-PR
+text(0.6, 0.9, paste("XGBoost - AUC PR:", auc_xgb_Test, sep = " "), col = couleur_xgb_Test)
+text(0.6, 0.8, paste("XGBoost + Clinical - AUC PR:", auc_xgb_Clinical, sep = " "), col = couleur_xgb_Clinical)
+
+# Ajout d'un encadré noir
+box(col = "black")
+```
+
+
+
+```{r}
+### PRAUC curves
+
+g <- ggplot() +
+        geom_line(data = coords(rocobj_xgb_Test, "all", ret = c("precision", "recall")), aes(x = recall, y = precision, color = "XGBoost")) +
+        geom_line(data = coords(rocobj_xgb_Clinical, "all", ret = c("precision", "recall")), aes(x = recall, y = precision, color = "XGBoost + Clinical")) +
+        labs(x = "Recall", y = "Precision", title = "Title", color = "Dataset") + 
+        coord_fixed(ratio = 1) +  # This will make the plot square
+        theme_minimal() +
+        theme(
+            plot.title = element_text(size = 12, hjust = 0.5),
+            plot.subtitle = element_text(size = 10, hjust = 0.5),
+            panel.border = element_rect(linetype = "solid", color = "black", size = 1, fill = NA), # Ajout d'un cadre noir
+            panel.grid.major = element_blank(),
+            panel.grid.minor = element_blank(),
+            axis.text.x = element_text(size = 12),  # Increase size of X axis labels
+            axis.text.y = element_text(size = 12),  # Increase size of Y axis labels
+            axis.title.x = element_text(size = 14),  # Increase size of X axis title
+            axis.title.y = element_text(size = 14),  # Increase size of Y axis title
+            legend.position = "bottom", # Set the legend box outside the main frame
+            legend.direction = "horizontal",
+            legend.box = "horizontal",
+            legend.margin = margin(t = 10, b = 10, unit = "pt"),
+            legend.text = element_text(size = 12),
+            legend.justification = c(1, 0),
+            legend.box.just = "center",  # Set the legend box justification to right
+            legend.title = element_blank(),  # Remove legend title
+            legend.box.background = element_rect(color = "black", fill = NA),
+            plot.margin = margin(20, 20, 20, 20), 
+            plot.background = element_rect(fill = "white", color = "white", size = 1)) +  # Add a white background
+        scale_y_continuous(limits = c(0, 1)) +  # Set y-axis limits to 0 and 1
+        scale_color_manual(values = c("#cc0066", "#00cc00"), 
+                labels = c(sprintf("XGBoost - AUC PR = %.2f", PR_auc_xgb_Test), 
+                sprintf("XGBoost + Clinical - AUC PR = %.2f", PR_auc_xgb_Clinical)))
+g
+
+
+
+
+```
+```{r}
+g <- ggplot() +
+        geom_line(data = coords(rocobj_xgb_Test, "all", ret = c("precision", "recall")), 
+                  aes(x = recall, y = precision, color = "XGBoost")) +
+        geom_line(data = coords(rocobj_xgb_Clinical, "all", ret = c("precision", "recall")), 
+                  aes(x = recall, y = precision, color = "XGBoost + Clinical")) +
+        geom_smooth(data = coords(rocobj_xgb_Test, "all", ret = c("precision", "recall")), 
+                    aes(x = recall, y = precision, color = "XGBoost"), 
+                    method = "loess", span = 0.05) +  # Lissage avec loess pour XGBoost
+        geom_smooth(data = coords(rocobj_xgb_Clinical, "all", ret = c("precision", "recall")), 
+                    aes(x = recall, y = precision, color = "XGBoost + Clinical"), 
+                    method = "loess", span = 0.1) +  # Lissage avec loess pour XGBoost + Clinical
+        labs(x = "Recall", y = "Precision", title = "Title", color = "Dataset") + 
+        coord_fixed(ratio = 1) + 
+        theme_minimal() +
+       theme(
+            plot.title = element_text(size = 12, hjust = 0.5),
+            plot.subtitle = element_text(size = 10, hjust = 0.5),
+            panel.border = element_rect(linetype = "solid", color = "black", size = 1, fill = NA), # Ajout d'un cadre noir
+            panel.grid.major = element_blank(),
+            panel.grid.minor = element_blank(),
+            axis.text.x = element_text(size = 12),  # Increase size of X axis labels
+            axis.text.y = element_text(size = 12),  # Increase size of Y axis labels
+            axis.title.x = element_text(size = 14),  # Increase size of X axis title
+            axis.title.y = element_text(size = 14),  # Increase size of Y axis title
+            legend.position = "bottom", # Set the legend box outside the main frame
+            legend.direction = "horizontal",
+            legend.box = "horizontal",
+            legend.margin = margin(t = 10, b = 10, unit = "pt"),
+            legend.text = element_text(size = 12),
+            legend.justification = c(1, 0),
+            legend.box.just = "center",  # Set the legend box justification to right
+            legend.title = element_blank(),  # Remove legend title
+            legend.box.background = element_rect(color = "black", fill = NA),
+            plot.margin = margin(20, 20, 20, 20), 
+            plot.background = element_rect(fill = "white", color = "white", size = 1)) + 
+        scale_y_continuous(limits = c(0, 1)) +
+        scale_color_manual(values = c("#cc0066", "#00cc00"), 
+                           labels = c(sprintf("XGBoost - AUC PR = %.2f", PR_auc_xgb_Test), 
+                                      sprintf("XGBoost + Clinical - AUC PR = %.2f", PR_auc_xgb_Clinical)))
+g
+```
+
+### Perfomance metrics
+```{r}
+probXGB_Train = predict(xgb_model,newdata=dataset_Train_selection, type="prob")
+probXGB_Train = probXGB_Train[,2]
+
+Best_Threshold_Xgb_Train <- get_best_threshold(y_true = dataset_Train_selection$MACE, y_pred = probXGB_Train)
+
+probXGB_Train_clinical = predict(xgb_model_clinical,newdata=dataset_Train, type="prob")
+probXGB_Train_clinical = probXGB_Train_clinical[,2]
+
+Best_Threshold_Xgb_Train_clinical <- get_best_threshold(y_true = dataset_Train_selection$MACE, y_pred = probXGB_Train_clinical)
+
+probXGB = predict(xgb_model,newdata=dataset_Validation_selection, type="prob")
+probXGB = probXGB[,2]
+repXGB = ifelse(probXGB >= Best_Threshold_Xgb_Train,1,0)
+
+probXGB_Clinical = predict(xgb_model_clinical,newdata=dataset_Validation, type="prob")
+probXGB_Clinical = probXGB_Clinical[,2]
+repXGB_Clinical = ifelse(probXGB >= Best_Threshold_Xgb_Train_clinical,1,0)
+
+
+# XGB classique
+auc_xgb <- round(auc(dataset_Validation_selection$MACE, probXGB),4) #0.853
+PR_auc_xgb <- PRAUC(y_pred = probXGB, y_true = dataset_Validation_selection$MACE) #0.59
+f1_XGB <- F1_Score(y_pred = repXGB, y_true = dataset_Validation_selection$MACE,positive="1")
+
+ci.auc(dataset_Validation_selection$MACE, probXGB) 
+
+sensitivity_XGB <- Sensitivity(dataset_Validation_selection$MACE, repXGB, positive = "1")
+specificity_XGB <- Specificity(dataset_Validation_selection$MACE, repXGB, positive = "1")
+precision_XGB <- Precision(dataset_Validation_selection$MACE, repXGB, positive = "1")
+Brier_XGB <- BrierScore(dataset_Validation_selection$MACE, probXGB)
+accuracy_XGB = Accuracy(repXGB,dataset_Validation_selection$MACE)
+Kappa_XGB = kappa2(ratings = cbind(repXGB,dataset_Validation_selection$MACE))
+Kappa_XGB = Kappa_XGB$value
+balanced_accuracy_XGB = (sensitivity_XGB+specificity_XGB)/2
+cMatrix_XGB <- confusionMatrix(data=as.factor(repXGB), reference = as.factor(dataset_Validation_selection$MACE), positive = '1')
+cMatrix_XGB
+
+# XGB avec clinique
+auc_xgb_clinical <- round(auc(dataset_Validation$MACE, probXGB_Clinical),4) #0.87
+PR_auc_xgb_clinical <- PRAUC(y_pred = probXGB_Clinical, y_true = dataset_Validation$MACE) #0.59
+f1_XGB_clinical <- F1_Score(y_pred = repXGB_Clinical, y_true = dataset_Validation_selection$MACE,positive="1")
+
+ci.auc(dataset_Validation_selection$MACE, probXGB_Clinical) 
+
+sensitivity_XGB_clinical <- Sensitivity(dataset_Validation_selection$MACE, repXGB_Clinical, positive = "1")
+specificity_XGB_clinical <- Specificity(dataset_Validation_selection$MACE, repXGB_Clinical, positive = "1")
+precision_XGB_clinical <- Precision(dataset_Validation_selection$MACE, repXGB_Clinical, positive = "1")
+Brier_XGB_clinical <- BrierScore(dataset_Validation_selection$MACE, probXGB)
+accuracy_XGB_clinical = Accuracy(repXGB_Clinical,dataset_Validation_selection$MACE)
+Kappa_XGB_clinical = kappa2(ratings = cbind(repXGB_Clinical,dataset_Validation_selection$MACE))
+Kappa_XGB_clinical = Kappa_XGB_clinical$value
+balanced_accuracy_XGB_clinical = (sensitivity_XGB_clinical+specificity_XGB_clinical)/2
+cMatrix_XGB_clinical <- confusionMatrix(data=as.factor(repXGB_Clinical), reference = as.factor(dataset_Validation_selection$MACE), positive = '1')
+cMatrix_XGB_clinical
+
+
+```
+
+
+## XGBoost CMR-CCTA vs CCTA alone vs CMR alone
+
+```{r}
+dataset_Train_CT_only <- subset(dataset_Train,select = c(MACE, Segments_Noncalcified_Plaques, Vessels_Obstructive_CAD, Proximal_Segments_Stenosis_Sup_50percent,Segments_Mixed_Plaques,Segments_Stenosis_Sup_50percent))
+
+dataset_Train_CMR_only <- subset(dataset_Train,select = c(MACE, LVEF, LVEDVi, RV_Dysfunction, Ischemia_Segments,LGE_Segments))
+```
+### XGBoost CT only
+```{r}
+dataset_train_XGB_CT <- dataset_Train_CT_only
+dataset_train_XGB_CT$Vessels_Obstructive_CAD <- as.numeric(dataset_train_XGB_CT$Vessels_Obstructive_CAD)
+dataset_train_XGB_CT$Proximal_Segments_Stenosis_Sup_50percent <- as.numeric(dataset_train_XGB_CT$Proximal_Segments_Stenosis_Sup_50percent)
+dataset_train_XGB_CT$Segments_Mixed_Plaques <- as.numeric(dataset_train_XGB_CT$Segments_Mixed_Plaques)
+dataset_train_XGB_CT$Segments_Stenosis_Sup_50percent <- as.numeric(dataset_train_XGB_CT$Segments_Stenosis_Sup_50percent)
+dataset_train_XGB_CT$Segments_Noncalcified_Plaques <- as.numeric(dataset_train_XGB_CT$Segments_Noncalcified_Plaques)
+dataset_train_XGB_CT$MACE <- ifelse(dataset_train_XGB_CT$MACE == 0,"X0","X1")
+
+ctrlspecs <- trainControl(method="cv", number=5)
+
+final_grid_CT <- expand.grid(
+  nrounds = 500,
+  eta = 0.015,
+  max_depth = 5,
+  gamma = 0.7,
+  colsample_bytree = 1,
+  min_child_weight = 3,
+  subsample = 0.5)
+
+xgb_model_CT <- train(
+  MACE ~ .,
+  data = dataset_train_XGB_CT,
+  trControl = ctrlspecs,
+  tuneGrid = final_grid_CT,
+  method = "xgbTree",
+  verbose = TRUE
+)
+
+probXGB_CT_Train = predict(xgb_model_CT,newdata=dataset_train_XGB_CT, type="prob")
+probXGB_CT_Train = probXGB_CT_Train[,2]
+best_threshold_XGB_CT = get_best_threshold(y_true = dataset_Train$MACE, y_pred = probXGB_CT_Train)
+```
+
+### XGBoost CMR only
+```{r}
+dataset_train_XGB_CMR <- dataset_Train_CMR_only
+dataset_train_XGB_CMR$LVEF <- as.numeric(dataset_train_XGB_CMR$LVEF)
+dataset_train_XGB_CMR$LVEDVi <- as.numeric(dataset_train_XGB_CMR$LVEDVi)
+dataset_train_XGB_CMR$Ischemia_Segments <- as.numeric(dataset_train_XGB_CMR$Ischemia_Segments)
+dataset_train_XGB_CMR$LGE_Segments <- as.numeric(dataset_train_XGB_CMR$LGE_Segments)
+dataset_train_XGB_CMR$RV_Dysfunction <- as.numeric(dataset_train_XGB_CMR$RV_Dysfunction)
+dataset_train_XGB_CMR$MACE <- ifelse(dataset_train_XGB_CMR$MACE == 0,"X0","X1")
+
+ctrlspecs <- trainControl(method="cv", number=5)
+
+final_grid_CMR <- expand.grid(
+  nrounds = 100,
+  eta = 0.05,
+  max_depth = 3,
+  gamma = 0.7,
+  colsample_bytree = 0.8,
+  min_child_weight = 1,
+  subsample = 0.75)
+
+xgb_model_CMR <- train(
+  MACE ~ .,
+  data = dataset_train_XGB_CMR,
+  trControl = ctrlspecs,
+  tuneGrid = final_grid_CMR,
+  method = "xgbTree",
+  verbose = TRUE
+)
+
+probXGB_CMR_Train = predict(xgb_model_CMR,newdata=dataset_train_XGB_CMR, type="prob")
+probXGB_CMR_Train = probXGB_CMR_Train[,2]
+best_threshold_XGB_CMR = get_best_threshold(y_true = dataset_Train$MACE, y_pred = probXGB_CMR_Train)
+```
+
+### Performance
+```{r}
+probXGB_Validation_CMR_CT = predict(xgb_model,newdata = dataset_Validation, type="prob")
+probXGB_Validation_CMR_CT = probXGB_Validation_CMR_CT[,2]
+repXGB_Validation_CMR_CT = ifelse(probXGB_Validation_CMR_CT >= best_threshold_XGB,1,0)
+
+probXGB_Validation_CT = predict(xgb_model_CT,newdata = dataset_Validation, type="prob")
+probXGB_Validation_CT = probXGB_Validation_CT[,2]
+repXGB_Validation_CT = ifelse(probXGB_Validation_CT >= best_threshold_XGB_CT,1,0)
+
+probXGB_Validation_CMR = predict(xgb_model_CMR,newdata=dataset_Validation, type="prob")
+probXGB_Validation_CMR = probXGB_Validation_CMR[,2]
+repXGB_Validation_CMR = ifelse(probXGB_Validation_CMR >= best_threshold_XGB_CMR,1,0)
+
+# ---------------- #
+auc_XGBoost_CMR_CT <- round(auc(dataset_Validation$MACE, probXGB_Validation_CMR_CT),2) # 0.86
+auc_XGBoost_CMR <- round(auc(dataset_Validation$MACE, probXGB_Validation_CMR),2) # 0.83
+auc_XGBoost_CT <- round(auc(dataset_Validation$MACE, probXGB_Validation_CT),2) # 0.76
+# ---------------- #
+PR_auc_CMR_CT <- round(PRAUC(y_pred = probXGB_Validation_CMR_CT, y_true = dataset_Validation$MACE),2) # 0.60
+PR_auc_CMR <- round(PRAUC(y_pred = probXGB_Validation_CMR, y_true = dataset_Validation$MACE),2) # 0.46
+PR_auc_CT <- round(PRAUC(y_pred = probXGB_Validation_CT, y_true = dataset_Validation$MACE),2) # 0.39
+
+# ---- CMR ---- #
+f1_XGBoost_CMR <- F1_Score(y_pred = repXGB_Validation_CMR, y_true = dataset_Validation$MACE,positive="1")
+ci.auc(dataset_Validation$MACE, probXGB_Validation_CMR) 
+Brier_XGB_CMR_Validation <- BrierScore(dataset_Validation$MACE, probXGB_Validation_CMR)
+accuracy_XGB_CMR_Validation = Accuracy(repXGB_Validation_CMR,dataset_Validation$MACE)
+Kappa_XGB_CMR_Validation = kappa2(ratings = cbind(repXGB_Validation_CMR,dataset_Validation$MACE))
+Kappa_XGB_CMR_Validation = Kappa_XGB_CMR_Validation$value
+cMatrix_XGB_CMR_Validation <- confusionMatrix(data=as.factor(repXGB_Validation_CMR), reference = as.factor(dataset_Validation$MACE), positive = '1')
+cMatrix_XGB_CMR_Validation
+```
+
+### ROC 
+```{r}
+rocobj_xgb_CMR_CT <- roc(dataset_Validation$MACE, probXGB_Validation_CMR_CT, main = "Smoothing")
+rocobj_xgb_CMR <- roc(dataset_Validation$MACE, probXGB_Validation_CMR, main = "Smoothing")
+rocobj_xgb_CT <- roc(dataset_Validation$MACE, probXGB_Validation_CT, main = "Smoothing")
+
+rocobj1 <- rocobj_xgb_CMR_CT
+rocobj2 <- rocobj_xgb_CT
+rocobj3 <- rocobj_xgb_CMR
+
+roclist <- list("XGBoost CMR CCTA - AUROC = 0.86" = rocobj1,
+                "XGBoost CMR only - AUROC = 0.83" = rocobj3,
+                "XGBoost CT only - AUROC = 0.76" = rocobj2)
+
+g <- ggroc(roclist, aes = "colour", legacy.axes = TRUE) + geom_line(size = 0.8) +
+  theme_classic()+
+  ggtitle("Title") +
+  labs(x = "1 - Specificity",
+       y = "Sensitivity") +
+  coord_fixed(ratio = 1) +  # This will make the plot square
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 14, hjust = 0.5),
+    plot.subtitle = element_text(size = 12, hjust = 0.5),
+    panel.border = element_rect(linetype = "solid", color = "black", size = 1, fill = NA), # Ajout d'un cadre noir
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    axis.text.x = element_text(size = 12),  # Increase size of X axis labels
+    axis.text.y = element_text(size = 12),  # Increase size of Y axis labels
+    axis.title.x = element_text(size = 14),  # Increase size of X axis title
+    axis.title.y = element_text(size = 14),  # Increase size of Y axis title
+    legend.position = "bottom", # Set the legend box outside the main frame
+    legend.direction = "horizontal",
+    legend.box = "horizontal",
+    legend.margin = margin(t = 10, b = 10, unit = "pt"),
+    legend.text = element_text(size = 12),
+    legend.justification = c(1, 0),  # Set the justification to bottom-right
+    legend.box.just = "right",  # Set the legend box justification to right
+    legend.title = element_blank(),  # Remove legend title
+    legend.box.background = element_rect(color = "black", fill = NA)) +  # Add black border
+
+  scale_colour_manual(values = c("#cc0066", "#00cc00","#0080ff"))
+
+
+# Add the y = x line (line of equality)
+g <- g + geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "black")
+g
+
+roc.test(rocobj_xgb_CMR_CT,rocobj_xgb_CMR,method = "delong")
+roc.test(rocobj_xgb_CMR_CT,rocobj_xgb_CT,method = "delong")
+```
+
+### PR 
+```{r}
+plot(precision ~ recall, coords(rocobj_xgb_Train, "all", ret = c("precision", "recall")), xlab = "Recall",ylab = "Precision", lwd = 2, type="l", col = c("#cc0066"), ylim = c(0,1), las = 1)
+lines(precision ~ recall, coords(rocobj_xgb_Validation, "all", ret = c("precision", "recall")), xlab = "Recall",ylab = "Precision", lwd = 2, type="l", col = c("#00cc00"))
+lines(precision ~ recall, coords(rocobj_xgb_Test_1, "all", ret = c("precision", "recall")), xlab = "Recall",ylab = "Precision", lwd = 2, type="l", col = "#0080ff") 
+abline(h = 0.13, lty = 2, col = "#000000")
+
+legend(0.01, 0.38, legend=c("XGBoost CMR CCTA - PRAUC = 0.60", "XGBoost CMR - PRAUC = 0.46",
+                            "XGBoost CCTA - PRAUC = 0.39"), 
+       fill = c("#cc0066", "#00cc00", "#0080ff"))
+
+```
+
+# Calibration
+## Validation
+```{r}
+library(predtools) # calibration_plot
+library(magrittr)
+
+data_forcalibration <- data.frame(dataset_Validation$MACE,probXGB_Validation)
+str(data_forcalibration)
+
+calibration_plot(data = data_forcalibration, obs = "dataset_Validation.MACE", pred = "probXGB_Validation", nTiles = 10, y_lim = c(0,1),x_lim = c(0,1), xlab="Predicted MACE rate", ylab="Observed MACE rate")
+
+library(PredictABEL)
+plotCalibration(data_forcalibration, 1,predRisk = probXGB)
+```
+## Test 1
+```{r}
+data_forcalibration <- data.frame(dataset_Test_1$MACE,probXGB_Test_1)
+str(data_forcalibration)
+
+calibration_plot(data = data_forcalibration, obs = "dataset_Test_1.MACE", pred = "probXGB_Test_1", nTiles = 10, y_lim = c(0,1),x_lim = c(0,1), xlab="Predicted MACE rate", ylab="Observed MACE rate")
+
+library(PredictABEL)
+plotCalibration(data_forcalibration, 1,predRisk = probXGB_Test_1)
+```
+
+## Test 2
+```{r}
+data_forcalibration <- data.frame(dataset_Test_2$MACE,probXGB_Test_2)
+str(data_forcalibration)
+
+calibration_plot(data = data_forcalibration, obs = "dataset_Test_2.MACE", pred = "probXGB_Test_2", nTiles = 10, y_lim = c(0,1),x_lim = c(0,1), xlab="Predicted MACE rate", ylab="Observed MACE rate")
+
+library(PredictABEL)
+plotCalibration(data_forcalibration, 1,predRisk = probXGB_Test_2)
+```
+```{r}
+ggplot(df_derivation_cal, aes(x = score, y = death_prop)) +
+  geom_point(aes(color = categ, size = total)) +
+  scale_color_manual(values = c("A_low_risk" = "green4", "B_medium_risk" = "orange", "C_high_risk" = "red")) +
+  scale_x_continuous(breaks = seq(min(df_derivation_cal$score), max(df_derivation_cal$score), by = 2)) +
+  geom_hline(yintercept = c(25, 50, 75, 100), color = "gray", linetype = "dashed") + # Adds gray lines for specified death proportions
+  theme_minimal() +
+  theme(
+    axis.line = element_line(color = "black"), # Adds black lines for both axes
+    axis.line.x = element_line(color = "black"), # Specific for X axis
+    axis.line.y = element_line(color = "black"), # Specific for Y axis
+    panel.grid.major = element_blank(),  # Removes major grid lines
+    panel.grid.minor = element_blank()   # Removes minor grid lines
+  ) +
+  labs(title = paste0("Proportion of death by Score in derivation cohort (N=",nrow(df_derivation_select_10),")"),
+       x = "Score",
+       y = "Death Proportion",
+       size = "Total Patients") +
+  guides(size = guide_legend(title = "Total Patients"))
+```
+
